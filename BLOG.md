@@ -19,6 +19,19 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-09-04
+
+### Stray was refusing a compute kernel over a register it had not read yet
+
+No picture — the kernel still does not run, and the reason it was skipped is the interesting part.
+One of Stray's title-screen compute programs died four dwords in, on `v_lshl_add_u32 v11, s14, 3, v0`
+— its own "which thread am I" arithmetic. The instruction was never the problem: we have lowered it
+for months. The problem was `s14`, which this shader uses as the workgroup id *and*, 153 dwords
+later, as somewhere to park M0 while it does something else. Our containment for that parking spot
+was marking the register unreadable at every block in the shader, including the first one — so the
+kernel was refused at instruction four for something it does at instruction 157. It now reasons about
+which saves can actually reach a given block. [#3308](https://github.com/mattias800/prosper/issues/3308)
+
 ## 2026-09-03
 
 ### The frozen frame that gave five pictures now gives one, 3,875 times running
