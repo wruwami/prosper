@@ -63,6 +63,127 @@ One compute program, `0x3011300000`, accounts for ~605 ms of that at roughly 32 
 3840×2160. So the cost is on the host side of the boundary, and pointing a GPU profiler at this title
 answers a question it does not have. Detail on [#3126](https://github.com/mattias800/prosper/issues/3126).
 
+### Inside the texture leaf (2026-09-04, `fc21d46ca`, 5.02 s at the title screen)
+
+The 1110 ms above is **one class of reference and two surfaces**. Read from the same `.prperf` with
+the frontend cache-outcome classes the report now prints:
+
+| class | ms | note |
+| --- | --- | --- |
+| rtt | 77.3 | |
+| compute | 59.9 | |
+| persist_hit | 25.0 | |
+| local | 17.1 | |
+| persist_reuse / persist_miss | 0.0 / 0.0 | |
+| **unclassified** | **930.8** | **84% of the leaf** |
+
+The slowest single unclassified reference is 59.6 ms, and its identity is the whole story:
+**3840×2160 RGBA16F, 63.8 MiB of tiled source, DCC on, a compute *and* a persistent candidate**, at
+one of exactly **two alternating addresses** (`0x30784e0000` / `0x30d10f0000`) — a double-buffered 4K
+HDR intermediate, re-decoded on every callback that samples it.
+
+**Which cache state that is, derived rather than guessed.** The capture predates the
+`persist_invalid` bucket, so the class is established by elimination from the witness's own fields
+plus the code — and the next capture will confirm or refute it directly, which is why the bucket
+exists:
+
+| step | from | conclusion |
+| --- | --- | --- |
+| `persist_cand=1` | `texture_decode_cache_candidate` | no live colour or depth target, no captured host data, `cls == Texture`, format supported |
+| `class=2` | the witness | `fr.is_storage_image` is `cls == StorageImage`, so false |
+| `compute_cand=1` with `dcc=1` | `compute_image_candidate` requires `!compression_enabled \|\| persistent_dcc_uncompressed` | the DCC plane is all-`0xff`, so `compression_supported` holds |
+| default launch | — | the cache is not disabled and its budget is non-zero |
+| ⟹ | `persistent_texture_decode_cache_eligible` | **eligible** — the lookup really does run |
+| `persist_miss = 0.00` over the whole window | the capture | not a miss, so the entry was FOUND |
+| `persist_hit = 25.0` total, and this reference is unclassified | the capture | not a hit |
+
+Eligible, found, and neither hit nor miss leaves exactly one state: **`resource_persistent_invalidation`**
+— the entry exists and its guest bytes changed. The cache is not broken; the content genuinely is
+new every frame, because a compute dispatch rewrites the surface. So no amount of cache tuning
+removes this decode. Only not making the round trip does.
+
+**Two thirds of that decode was the allocator and the kernel, not the decode.** Each reference built
+two fresh value-initialised `std::vector<uint8_t>` intermediates — 66,846,720 tiled bytes and
+66,355,200 linear — both past glibc's 32 MiB mmap threshold, so each was an `mmap`, 16,000 page
+faults, a memset and a `munmap`, per reference. Measured standalone at this exact shape:
+
+| | ms |
+| --- | --- |
+| fresh `traw`+`hlin`, copy + detile-equivalent traffic | 26.00 |
+| **the two fresh zero-initialised allocations alone** | **17.84** |
+| pooled `traw`+`hlin`, same copy and traffic | 6.00 |
+| pooled linear only, tiled source read in place | 2.83 |
+
+This is the same cost [#3149](https://github.com/mattias800/prosper/issues/3149) saw from outside as
+`__memmove_avx512` at 14.5% self and `clear_highpages_kasan_tagged` / `map_anon_folio_pte_nopf` /
+`zap_present_ptes` / `__free_one_page` under a 22.2% `do_syscall_64` — and attributed to the compute
+path, because that is where it looked. It is the graphics frontend materializer.
+
+Two more allocations of the same family sit on the same reference. The persistent cache re-stored a
+fresh 63.8 MiB `source_prefix` on every invalidation (13.00 ms at this shape) — it now inherits the
+allocation from the entry it replaces. The remaining one is **not** addressed:
+`cached.pixels = std::move(texture_pixels)` steals the pooled `texstore` slot, so the next decode
+allocates its 33 MiB output buffer fresh (~4.4 ms) — [#3310](https://github.com/mattias800/prosper/issues/3310).
+Fixing it needs a decision about buffer ownership between `texstore` and the persistent cache, which
+hands its buffer out as a `shared_ptr<const std::vector>` that never comes back.
+
+### Measured on the fix, live, 2026-09-04 (#3309)
+
+Same route and same F8 window, three arms on one binary. **The prediction was 660 ms and the
+measurement is 497.7.**
+
+| | baseline `fc21d46ca` | with #3309 | lever arm |
+| --- | --- | --- | --- |
+| rendered | 9.76 /s | **11.55 /s** | 10.15 /s |
+| `build_resources` texture | 1110.1 ms | **497.7 ms** | 918.2 ms |
+| ...of which `persist_invalid` | (no bucket yet) | 221.3 | 631.9 |
+| ...of which unclassified `other` | +930.8 | +144.3 | — |
+| renderer-resource | 1895.5 ms | 1384.1 ms | — |
+
+The 63.8 MiB RGBA16F witness is **gone from the top**: the slowest unclassified reference is now
+7.3 ms on a different, tiny surface (`0x30a0ac0000`, `fmt=7/1c`, `persist_cand=0`).
+
+**The derivation above survives in direction and rank, not in magnitude, and the magnitudes are not
+quotable.** It predicted `other` ≈ 0 with `persist_invalid` ≈ 900. What happened is `other` fell
+930.8 → 144.3 and `persist_invalid` is the largest single class — but at 221.3, because the same
+change that gave the residual a name also removed most of the cost the name was going to hold. A
+prediction whose own fix invalidates its arithmetic is confirmed about *which* state, not about
+*how much*.
+
+**The lever arm's gap has a known cause, and how much of it that cause accounts for is NOT
+established.** The arm returns the leaf to 918.2 rather than 1110.1. What is established, by reading
+the code rather than by inference, is that at the time it ran **one of the four changes had no
+off-switch** — the `source_prefix` inheritance — so it was necessarily still active in the "off"
+arm, and *some* of the 191.9 ms gap is therefore it. What is **not** established is that all of it
+is: the standalone figure predicts ~133 ms (13.00 ms per invalidation over ~14 references), the two
+captures are separate runs, and `setup_resources` buffer copy also moved between them (512.6 → 596),
+so run-to-run variance here is not zero. `PROSPER_NO_TEXTURE_PREFIX_INHERIT` exists to settle it in
+one arm. Until that arm is run, the 918.2 is known to under-report #3309 by an unquantified amount —
+which is a weaker and more useful statement than a number.
+
+The disarmed arm, to be pasted rather than typed — `PROSPER_DECODE_SCRATCH_MB` is a budget, so a
+malformed value keeps its 512 MiB default and leaves the pool **armed** while the run looks disarmed:
+
+```
+PROSPER_NO_DIRECT_TEXTURE_SOURCE=1 PROSPER_DECODE_SCRATCH_MB=0 PROSPER_NO_TEXTURE_PREFIX_INHERIT=1
+```
+
+**Compute rose 1981.5 → 2351.4 ms in the same window, and that is not a regression** — the window
+is fixed at 5.02 s, so a pipeline that renders 18% more frames also issues more dispatches into it.
+The bucket total is throughput, not cost. The discriminating pair is mean-ms-per-dispatch and
+dispatch count, both of which the report already prints per program.
+
+### The lever that is worth more than all of this
+
+The witness says `compute_cand=1`: the surface is a **compute image candidate whose import misses
+every frame**. `import_live_compute_storage_image` finds nothing under its key, so graphics falls
+through to the guest-byte decode. If that import hit, the 63.8 MiB writeback → detile → convert
+disappears **on both sides of the boundary** — the graphics decode and the compute writeback that
+feeds it. That is a bigger lever than every allocation above put together, and it lives in the
+compute cache's admission, not in the materializer. Both halves of that round trip are read
+together in [#3307](https://github.com/mattias800/prosper/issues/3307): the compute side's re-tile
+into guest memory, and the graphics side's read of those same bytes back out.
+
 ## The unresolved image ops — established on CALIBRATION
 
 > **The five-op census below was read on the calibration screen**, like every other live census above
@@ -82,6 +203,279 @@ on any title could be attributed to a shader. **That is fixed** (#3132): fragmen
 the real guest program address, which turns this from an inference into a lookup. The five failures
 above predate the fix and were never re-attributed, so they remain unassigned to a stage — re-running
 the census is what would assign them.
+
+**Re-run 2026-09-03, on the TITLE SCREEN, and now attributed** (`origin/main` `fc21d46ca`,
+`tools/screenshot`, `reach-title-hold.pad`, `PROSPER_NULL_PAGE=1`, 30 frames). Five sites again, and
+`program=` is real this time:
+
+| program | pc | op | srsrc | `written` | resource AT that key |
+|---|---|---|---|---|---|
+| `0x3013540000` (VS) | 32 | `0x00` IMAGE_LOAD | s8 | 0 | **`cbuf`** — plus two `vbuf`, all three at `sgpr_base 8` |
+| `0x3013c60000` (PS) | 69 | `0x20` IMAGE_SAMPLE | s8 | 0 | none *that run* — see below: this stage declares image slots at dw 0, 8 **and** 16, samples all three, and which of them is intact varies per draw |
+| `0x30be9c0000` (PS) | 47 | `0x20` IMAGE_SAMPLE | s0 | 0 | **`cbuf`** |
+| `0x30131d0000` (CS) | 77 | `0x08` IMAGE_STORE | s0 | **1** | none at `srt=0x20` (the tag it carries) |
+| `0x30131d0000` (CS) | 50 | `0x47` | s0 | 0 | **`cbuf`** |
+
+Stage attribution: `0x30131d0000` is named by its own `[compute]` / `[compute-table]` lines; the other
+three are read off the binding base, which `assign_convention_bindings` sets to 32 for a pixel stage and
+2 otherwise (`kPsBindingBase`), with the two `VertexBuffer`s separating the vertex stage from compute.
+
+Two things follow, and neither needs another run.
+
+**`written=0` makes four of the five sites' printed fields vacuous.** `srt_tag`, `key_res`, `pc_res`
+and `alias_res` describe the `s_load`-tag, SRT-key, per-pc and copy-alias routes. `written=0` says the
+shader never wrote the SRSRC range — the descriptor is entry user data by the shader's own
+construction — so none of those routes can fire and the whole quadruple is a restatement of
+`written=0`, not evidence of absence. The route that *did* run is `by_sgpr_base(SRSRC)`, whose outcome
+the line did not print. The pc=77 row is the internal control: it reports `written=1` and its
+`srt_tag=0x20` field populates, because there its route ran.
+
+**Three of those four had a resource at exactly the requested SGPR, of the wrong class, discarded in
+silence.** `by_sgpr_base` is first-match-wins and class-blind, and the resolver took that hit and
+nulled it on class afterwards. So "nothing is bound here" and "a ConstantBuffer is bound here" printed the same
+line. The vertex row also settles that key collisions are ordinary rather than hypothetical on this
+title: one `ConstantBuffer` and two `VertexBuffer`s share `sgpr_base 8`. Both the lookup and the
+diagnostic are fixed in #3126's PR; the lookup fix **does not by itself resolve any of these five**,
+because none of these tables holds an image-class resource at the requested key at all.
+
+**One dispatch pair shows the classification itself is unstable.** Compute `0x30131d0000` publishes the
+descriptor at `s0` as `class=2` (Texture, `[compute-table] … addr=0x30c5150000 size=16588800 sgpr=0
+pc=50`) on one dispatch — where pc=50 resolves through `by_fetch_pc` — and as a `ConstantBuffer` on
+another, where it does not. Every other producer of a compute resource sets `sgpr_base = 0xFFFFFFFF`,
+and `build_shader_resources`' `sharp[3]` loop is class-static, so this came from one of the two loops
+that classify a user-data slot by a four-dword V#-shape test on bytes that differ per dispatch — which
+is consistent with this title's own `PROSPER_SHARPLOG` figure of **16 textures dropped "claimed by the
+V# path"** (#3126, 2026-08-30). CONFIDENCE: MED on that attribution, HIGH that the class of one slot
+changes within a single run.
+
+This is deliberately **not** a re-assertion of the "present at the right SGPR and mis-classified as a
+buffer" claim that #3126's 2026-08-30 thread retracted: that retraction was scoped to the three big
+compute stages, whose tables were shown complete, and it stands. What is added here is a different
+stage and a different kind of evidence — a class that changes between two dispatches of one program.
+An earlier usage-driven fix attempt is also already recorded there as not firing; do not restart from
+it without reading why.
+
+**MEASURED, same route, `PROSPER_DYNTRACE_FAIL=1` — the five sites have no descriptor bytes to find, by
+either route.** `resolve_dynamic_fetch` handles the direct case as well as the table one:
+`untouched_seed_range(tbase, 8)` publishes a `SrtUse` with the live eight dwords and `use_pc`, which
+becomes `fetch_pc` provenance — the resolver's *first* lookup. So `pc_res=null` could have meant "the
+fold declined the bytes" or "it produced them and materialization dropped them", and `[dyntrace]`
+separates those in one line:
+
+```
+MIMG pc=32 op=0x00 srsrc=s8  ssamp=s0   have_t8=0 seed_t8=0  key=0xffffffff  t8=<unknown>
+MIMG pc=69 op=0x20 srsrc=s8  ssamp=s72  have_t8=0 seed_t8=0  key=0xffffffff  t8=<unknown>
+MIMG pc=47 op=0x20 srsrc=s0  ssamp=s8   have_t8=0 seed_t8=0  key=0xffffffff  t8=<unknown>
+MIMG pc=50 op=0x20 srsrc=s0  ssamp=s8   have_t8=0 seed_t8=0  key=0xffffffff  t8=<unknown>
+MIMG pc=77 op=0x08 srsrc=s0  ssamp=s0   have_t8=1 seed_t8=0  key=0x20        t8=3096cb00 c0d00000 …
+```
+
+Every `written=0` site is `have_t8=0 seed_t8=0`: no traced T#, **and** the entry user-data bytes were not
+a plausible T#. The `written=1` row is again the control — `have_t8=1`, `key=0x20`, real descriptor
+words, the one site whose route ran.
+
+**The zero is a measurement, not a silence, because both routes demonstrably fire elsewhere in the same
+run**: 29 lines `have_t8=1 seed_t8=0` (traced), 21 `have_t8=0 seed_t8=1` (plausible seed), 9
+`have_t8=0 seed_t8=0`. A working seed for contrast: `pc=82 srsrc=s0 seed_t8=1 → base=0x3072050000
+240x1`. Without that population the null would be void rather than negative.
+
+**No lookup route could have resolved these five** — which is why #3313's class-filtered lookup,
+correctly, resolves none of them. Beyond that the attribution is **OPEN**, and two attributions have
+already been proposed and withdrawn; read the next two paragraphs before proposing a third.
+
+**Withdrawn 1 — "#305/#3137 user-data window family".** The `[resdump]`/`[udcand]` output of the same
+run does not support it. #305's condition is a programmed block *larger* than the pipeline's user-SGPR
+window; site 1 declares `range=[0,20)` and the failing `srsrc=s8` is user-data dword **0**, the very
+first dword of that window (#305 measurement 4: user data begins at shader SGPR `s8`). `0x3013c60000`
+declares `[0,30)` likewise. `[udcand]` reports **`FITS-BLOCK`**, not a misfit. The one real link is that
+`0x0004dfac` appears three times in the block and #305 records that constant family — but it is a V#
+`dword3` in this title, so its presence is what a V# looks like, not evidence of a window fault.
+
+**Withdrawn 2 — "a texture descriptor is being consumed as a buffer".** The bytes at that offset are
+**present, readable, and a well-formed V#** — which is the opposite of a misclassified T#:
+
+```
+[resdump] sgprs@0x8c: 2f65b3cc 00100030 00000010 0004dfac  40f1a5c0 00100020 00000003 0004dfac …
+   dw0..3 as V#: base=0x302f65b3cc stride=16 num_records=16 size=256   -> V#-shape gate PASSES
+   dw4..7 as V#: base=0x2040f1a5c0 stride=16 num_records=3  size=48    -> V#-shape gate PASSES
+   dw0..7 as T#: base=0x302f65b3cc00 65x1 type=0                       -> bad-image-type
+```
+
+Two consecutive four-dword V#s, both with plausible PS5 guest VAs. So `seed_t8=0` is a *shape* verdict,
+not a residency one, and the V#-shape gate is not misfiring on ambiguous bytes: it is claiming bytes
+that really are a V#. `sharp[0]` declares one slot at `offset_dw 0` and `sharp[3]` two at 8 and 12,
+which maps exactly onto this stage's `[b4 cbuf s8] [b2 cbuf s16] [b3 cbuf s20]` (VS `user_sgpr_base = 8`).
+
+**And it is OBSERVED, not just derived — the same slot is dropped for both reasons in one run.**
+`tex_drop` keys on the reason as well as the slot, so both buckets print:
+
+```
+[sharp] ud=0x21e0e55590 ro[0] offset_dw=0 size=0 DROPPED as texture: claimed by the V# path
+[sharp] ud=0x21e0e55590 ro[0] offset_dw=0 size=0 DROPPED as texture: degenerate T# (bad-image-type)
+        base=0x300ae8fb5400 13713x11172x1 type=0 fmt=0
+        raw 0ae8fb54 00000030 0ae8fd64 00000030 00000000 00700000 00000000 00000000
+```
+
+Run-wide: **97 `claimed by the V# path`, 4 `degenerate T# (bad-image-type)`** — so on the 4 draws where
+the V# path did *not* claim it, the texture decoder reached those bytes and rejected them exactly as
+derived above. The prediction is measured.
+
+**The discriminator between the two buckets is one half-word**, and it is derivable from the raw dwords:
+`dw1`'s upper half is the V# `STRIDE` field. `0x00100030` → stride 16 → the read-only V# gate claims it;
+`0x00000030` → stride 0 → `!d.stride` rejects, the slot falls through to the texture loop, `type=0`,
+`bad-image-type`. Nothing else about the two buckets differs in kind.
+
+**Three different contents at one declared slot in one run**, none of them an image:
+
+| observed at user dwords 0..7 | as a V# | as two 64-bit pointers |
+| --- | --- | --- |
+| `2f65b3cc 00100030 00000010 0004dfac …` | base `0x302f65b3cc` stride 16, 16 records | not pointer-shaped |
+| `0ae8fb54 00000030 0ae8fd64 00000030 …` | stride 0 → rejected | `0x300ae8fb54`, `0x300ae8fd64` (Δ `0x210`) |
+| `2f70fbb8 00000030 2f70fdcc 00000030 …` | stride 0 → rejected | `0x302f70fbb8`, `0x302f70fdcc` (Δ `0x214`) |
+
+Both `bad-image-type` samples are two clean, adjacent guest pointers plus a constant `0x00700000` at
+dword 5. So the payload is not one stable wrong value — it **varies by draw**, and across 101 sampled
+drops the declared image slot never once held an image descriptor.
+
+**Settled: the guest declares an eight-dword T# there.** `PROSPER_SHARPLOG=1` together with
+`PROSPER_DYNTRACE_FAIL=1` — both are needed, because `[sharp]` keys on `ud=` and only `[resdump]` ties a
+`ud` pointer to a code address, and the pointer differs between runs:
+
+```
+[sharp] ud=0x21e0e55590 nsgpr=32 base=8 eud_size_dw=0 srt_size_dw=0 counts: ro=1 rw=0 samp=0 cbuf=2 direct=11
+[sharp]   ro[0]:   bits=0x0000 offset_dw=0  size=0        <- eight-dword T#
+[sharp]   cbuf[0]: bits=0x8008 offset_dw=8  size=1
+[sharp]   cbuf[1]: bits=0x800c offset_dw=12 size=1
+[sharp]   direct[8]:  sgpr=16      (type 8  = vertex buffer)
+[sharp]   direct[10]: sgpr=18      (type 10 = vertex attrib)
+```
+
+So the **declaration and the memory disagree at slot 0 and nowhere else**: an 8-dword read-only image is
+declared at user dword 0, and what is there is two well-formed 4-dword V#s. That kills reading 2 above
+(it is not a genuine V# slot prosper mis-declares).
+
+**The seeding base is right, corroborated twice and independently of the disagreement.** The declared
+layout occupies dwords 0..19 and `[resdump]` reports `user_data_range_end = 20` — exact. And
+`direct[8]`/`direct[10]` at dwords 16 and 18 land on two mapped 64-bit guest pointers, the first of
+which dereferences to a well-formed V#:
+
+```
+[direct-reject] type=8  sgpr=16 words=0a852a6c:00000030:a0eeabd0:00000022   (two pointer pairs)
+[direct-deref]  type=8  sgpr=16 at=0x300a852a6c -> base=0x2120e82400 rd=1 size=192 stride=32 fmt=11
+[direct-deref]  type=10 sgpr=18 at=0x22a0eeabd0 -> base=0x2020f80026e0 rd=0 size=65024 stride=4
+```
+
+An eight-dword shift of the window would have to put a cbuf V#'s leading dwords exactly where two
+dereferenceable guest pointers are. So this is not a seeding fault.
+
+The shader-SGPR half of the mapping (`user_sgpr_base = 8` for a non-PS stage, hardcoded in
+`build_stage_table`) is corroborated separately, and cheaply: this stage declares **exactly one**
+read-only image, at user dword 0, and has **exactly one** image op, naming `s8`. Under the +8 mapping
+those are the same slot. If the mapping were wrong, that agreement would be a coincidence.
+
+**Therefore the classification fix cannot fix this site — falsified from the bytes, no run needed.**
+The direction #3126's thread has circled since 2026-08-30 is "let usage, or the declared width, beat the
+V#-shape heuristic". Suppose it did, and slot 0 were never claimed as a V#. The read-only texture loop
+would then decode those same eight dwords as a T#: `type = (t[3] >> 28) = (0x0004dfac >> 28) = 0`, and
+`valid_image_type` admits only 8..15 (`agc_shader_layout.hpp:183`), so
+`image_descriptor_reject_reason` returns **`bad-image-type`** and the slot is dropped anyway. Same
+rejection, a different `continue`. **The defect is upstream of classification entirely.** A
+classification change may still be right on its own merits for other titles; it is not this site's fix,
+and an A/B of it here would come back "unchanged" for a reason that has nothing to do with the change.
+
+**Instrument note, so nobody reads a signal into it.** The run reports 235,016 `[direct-reject]` against
+235,008 `[direct-deref]`. That near-parity is structural, not a finding: the deref line is printed
+*inside* the reject branch (`agc_shader_layout.cpp`, the `#2412` block) and only when `d.base` is
+mapped, so derefs are a subset of rejects by construction and the 8-line difference is 8 slots whose
+base was zero or unmapped. Both lines describe one event.
+
+**Resolved on the `PROSPER_UDPROV` run: a declared descriptor slot is partially rewritten between the
+pipeline bind and the draw, and whichever slot the sampled op needs is sometimes the mangled one.**
+
+The pixel stage `0x3013c60000` makes this exact, because it has several image ops and its slots fail
+*independently*. It declares four read-only slots:
+
+```
+[sharp] ud=0x21e0e52b48 nsgpr=32 base=0 eud_size_dw=28 counts: ro=4 rw=0 samp=4 cbuf=2 direct=11
+[sharp]   ro[0]: offset_dw=0  size=0     ro[1]: offset_dw=8  size=0
+[sharp]   ro[2]: offset_dw=16 size=0     ro[3]: offset_dw=32 size=0 (EUD)
+```
+
+In one run, exactly two of them are dropped, and exactly the two ops that sample those two slots fail —
+a **1:1 correspondence, with the third op never appearing**:
+
+| slot | outcome that run | op sampling it |
+| --- | --- | --- |
+| `ro[0]` dw0 | `DROPPED as texture: claimed by the V# path` | `pc=82 srsrc=s0` → `[mimg-unresolved]` |
+| `ro[1]` dw8 | kept — `[b37 tex s8]` in both available lists | never fails |
+| `ro[2]` dw16 | `DROPPED: degenerate T# (base-below-low-pointer-guard) base=0x9200` | `pc=89 srsrc=s16` → `[mimg-unresolved]` |
+
+So "the descriptor is absent" was never the right description. **`ro[1]`'s eight dwords decode as a
+perfectly ordinary render-target-sized texture** — `base=0x307c620000 1920x1080 type=9 (2D) fmt=36
+tile_mode=27 base_level=0` — and its op resolves. The failures track the slot, not the shader.
+
+**The provenance says what mangles a slot, and it lands MID-DESCRIPTOR.** The pixel stage's own block
+is `base=0xc` (`SPI_SHADER_USER_DATA_PS_0`; `[udprov]` dumps all three candidate bases per stage, and
+`0x8c` is the *GS* block, i.e. the vertex stage's — do not read the PS's failure off the `0x8c` rows):
+
+```
+base=0xc  dw0..dw3   @d564819 / q3, f2990      <- rewritten, next frame, different queue
+          dw4..dw29  @d564801 / q1, f2989      <- same fold as the bind at i564796/q1,f2989
+draw_order = 564827
+```
+
+`ro[0]` occupies dwords 0..7, so the split falls **four dwords into an eight-dword descriptor**. Its
+surviving tail still looks like a T# tail (`00000000 00700000 006b0000 003070c0`, near-identical to the
+intact `ro[1]`'s `00000000 00700000 006b0000 00307d62`), while its head is now a V#
+(`base=0x20e0e42400 stride=16 num_records=8`) — which is precisely why that slot prints `claimed by the
+V# path`. A producer rebinding an image slot would write all eight dwords; writing exactly the first
+four is a **different producer with a different layout**, one for which dwords 0..3 are a four-dword
+slot.
+
+The vertex stage shows the same shape at its own boundary: `base=0x8c` splits at dword 8, exactly the
+extent of its single declared `ro[0]`, `dw0..7 @d564823/q3,f2990` against `dw8..19 @d564799/q1,f2989`.
+
+**This does not name a fix, and two obvious ones are already dead.** `RESOURCE_BINDING.md` § Ruled out
+records that giving DcbFinal its own `GpuState` was tested and ruled out as a fix, and that re-seeding
+the block from the `[udcand]` implied offset is falsified — and this run agrees with the second
+independently: `[udmap] … specials raw=[0,20) seeded=0 implied=0`, i.e. the implied-seed search finds
+no better offset. What is new is that the corruption is a **partial, mid-descriptor overwrite from the
+following frame's fold**, which is a sharper statement than "the block is wrong".
+
+**Two things here bear on #305 and belong in that issue, not this one.** First, the recorded frontier
+signature — "the pipeline was bound in a `q1` (Dcb) fold *N*, while the … user-data block was written
+in the following `q3` (DcbFinal) fold *N+1*" — reproduces here on a third title, and the decisive
+measurement #305 names (queue identity beside `command_order`) is what produced these numbers. Second,
+a **counter-example to a recorded observation**: #305 says the signature "appears in 8/12/28-dword
+vertex windows and not in 30/32-dword" and that pixel stages in that run had 30-dword windows. This
+pixel stage declares `[0,30)` and shows the split. Window fit does not predict the result here.
+(The GS-versus-PS asymmetry is *not* a tension — that acceptance test is retired; see § Current
+frontier.)
+
+**What is still open** is reading 1 versus reading 3: the guest wrote V#s into a slot it declares as a
+T# (a guest/driver-state question), or the image op sits on a path this binding never serves. Two
+next steps, in order:
+
+1. **Free — grep the run we already have.** `PROSPER_SHARPLOG`'s `tex_drop` names why a declared
+   texture slot was dropped: `[sharp] ud=0x21e0e55590 ro[0] offset_dw=0 size=0 DROPPED as texture: …`.
+   If it says `claimed by the V# path`, the chain is closed end to end from one log; if it says
+   `degenerate T# (bad-image-type)`, the V# path never even claimed it and the paragraph above is
+   already the whole story.
+2. **One run — `PROSPER_UDPROV=1`** (with the same two switches). It records each SH register's
+   last-write `command_order` and path into the per-draw snapshot, which answers the only question
+   left: who last wrote user dwords 0..7 before this draw, and did a T# ever occupy them. Read dwords
+   0..7 against 8..19 in the same snapshot; the second group is known-good, so it is a built-in
+   control. **If dwords 0..7 come back with an OLDER `command_order` than 8..19, do not quietly
+   resurrect #305's founding premise** — "the user-data block is a previous pipeline's leftover" is
+   recorded as falsified in `RESOURCE_BINDING.md` § Ruled out, measured at 21 stages on other titles,
+   so a contrary result here is a new finding that has to be argued against that measurement, not a
+   return to it.
+
+Note the scope: the `have_t8=0 seed_t8=0` result above covers all five sites, and the byte-level reading
+was first established for site 1 only. The `PROSPER_UDPROV` run extends it to the pixel stage, and in
+doing so shows the census row above is **run-specific**: on that run `0x3013c60000` fails at `pc=82
+srsrc=s0` and `pc=89 srsrc=s16` and resolves `s8`, the exact complement of the earlier run. Read the
+census as a sample of a varying state, not as a property of a shader.
 
 Separately, four stages declare a *writable* 8-dword T# that reaches no resource table at all
 ([#3128](https://github.com/mattias800/prosper/issues/3128)); one of them has four image ops against a
@@ -300,6 +694,53 @@ A ~13% reduction, groups non-overlapping. The visible frame does not change — 
 drops still discard the background.
 
 ## Ruled out
+
+- **"A recompile fix — resolving the unresolved image ops — restores the title-screen background."**
+  **Falsified on the title screen, and this row exists because the measurement was recorded NOWHERE a
+  hypothesis-former would look**: it lived only in a comment inside `rdna2_emit_alu.cpp` and in a
+  2026-08-30 issue thread, so the next three sessions (including this one) re-entered the descriptor
+  question without it. `PROSPER_MIMG_SOFT=1` writes a constant instead of failing the stage when an
+  image op cannot resolve, which answers the only question that matters for the goal: *how much of the
+  picture rides on this resolution failure*. On a **verified title-screen frame** the composite
+  compiled, zero `shader-recompile` drops landed on either swap-chain buffer, and `max_nonblack` stayed
+  **0.0069** — unchanged, still menu-only. Note the caveat and that it was cleared: the first run of
+  this instrument was unsound (it sat after the once-per-`(program, pc, srsrc)` dedupe, so only the
+  first compile of each site was softened, #3141 B3), and the result was **re-established on the fixed
+  instrument**, same conclusion. The background's blocker is upstream — the scene targets are black at
+  source, draws run and write nothing (§ *The scene targets are black AT SOURCE*), the same family as
+  *Grand Theft Auto V* and *Sonic Frontiers*. **Descriptor forensics on the five image ops is a
+  correctness matter, not the rung-3 blocker; do not spend a GPU run on it expecting a picture.**
+  #3126, #3138, #3140, #3141.
+
+- **"The five unresolved image ops are the #305/#3137 user-data window family"** and **"a texture
+  descriptor is being consumed as a buffer at the SGPR the image op names."** Both proposed and
+  **withdrawn on 2026-09-04**, within the hour, on the `PROSPER_DYNTRACE_FAIL=1` run's own
+  `[resdump]`/`[udcand]` output. The failing `srsrc=s8` is user-data dword **0** of a declared
+  `[0,20)` window with `[udcand]` reporting `FITS-BLOCK`, so #305's larger-block-than-window condition
+  is absent; and the eight dwords there are present, readable, and **two well-formed V#s**
+  (`base=0x302f65b3cc stride=16 num_records=16`, then `base=0x2040f1a5c0 stride=16 num_records=3`),
+  whose T# reading is `type=0` → `bad-image-type`. So `seed_t8=0` is a **shape** verdict, not a
+  residency one, and the V#-shape gate is claiming bytes that really are a V#. The shared `0x0004dfac`
+  constant is a V# `dword3` in this title, which is why it resembles #305's signature without being it.
+  What remains open is in § *The unresolved image ops* above. #3126, #3313.
+
+- **"Making classification obey usage, or the guest's declared slot width, instead of the four-dword
+  V#-shape heuristic will resolve `0x3013540000`'s image op."** **Falsified from the bytes, no run
+  needed**, 2026-09-04 — and it is the direction #3126's thread has circled since 2026-08-30, so it is
+  the most likely thing to be tried next. `PROSPER_SHARPLOG` confirms the guest declares slot 0 as an
+  eight-dword T# (`ro[0]: offset_dw=0 size=0`), so the premise is right; the conclusion is not. With the
+  V# claim suppressed, the read-only texture loop decodes those same eight dwords and gets
+  `type = (0x0004dfac >> 28) = 0`, which `valid_image_type` (8..15, `agc_shader_layout.hpp:183`)
+  rejects as **`bad-image-type`** — the slot is dropped either way, by a different `continue`. An A/B of
+  that change on this title would report "unchanged" for a reason unrelated to the change. The defect is
+  upstream of classification. #3126, #3313.
+
+- **"The user-data seeding base is wrong for this stage."** Falsified on the same run. The declared
+  layout occupies dwords 0..19 and `user_data_range_end = 20` exactly; `direct[8]`/`direct[10]` at
+  dwords 16 and 18 land on two mapped 64-bit guest pointers, and the first dereferences to a well-formed
+  V# (`base=0x2120e82400 stride=32 size=192`). An eight-dword shift would have to put a cbuf V#'s
+  leading dwords precisely where two dereferenceable pointers are. Slot 0 is the only place declaration
+  and memory disagree. #3126.
 
 - **"The surfaces prosper renders into read black because the live RTT cache does not treat them as
   authoritative, so the sampler falls through to zeroed guest memory."** Falsified (#3140) — 58,569

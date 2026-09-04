@@ -1303,6 +1303,12 @@ if(TARGET prosper_core)
   target_include_directories(test_write_watch_policy PRIVATE frontends src)
   add_test(NAME write_watch_policy COMMAND test_write_watch_policy)
 
+  # Pooled texture-decode intermediates. `src` for diagnostics/env_numeric.hpp, which the pool's
+  # retention knob parses through -- the equivalence arm is the one that matters (see the file head).
+  add_executable(test_decode_scratch frontends/shared/tests/test_decode_scratch.cpp)
+  target_include_directories(test_decode_scratch PRIVATE frontends src)
+  add_test(NAME decode_scratch COMMAND test_decode_scratch)
+
   add_executable(test_texture_decode_diagnostic
                  frontends/shared/tests/test_texture_decode_diagnostic.cpp)
   target_include_directories(test_texture_decode_diagnostic PRIVATE frontends src)
@@ -1804,6 +1810,11 @@ if(TARGET prosper_core)
   add_executable(test_direct_descriptor_copy tests/gpu/recompiler/test_direct_descriptor_copy.cpp)
   target_link_libraries(test_direct_descriptor_copy PRIVATE prosper_core)
   add_test(NAME direct_descriptor_copy COMMAND test_direct_descriptor_copy)
+
+  add_executable(test_image_descriptor_class_lookup
+                 tests/gpu/recompiler/test_image_descriptor_class_lookup.cpp)
+  target_link_libraries(test_image_descriptor_class_lookup PRIVATE prosper_core)
+  add_test(NAME image_descriptor_class_lookup COMMAND test_image_descriptor_class_lookup)
 
   # Bounded graphics-shader cache: cached modules must match the direct recompiler byte-for-byte.
   add_executable(test_shader_recompile_cache tests/gpu/execute/test_shader_recompile_cache.cpp)
