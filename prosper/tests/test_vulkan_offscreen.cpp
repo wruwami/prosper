@@ -123,8 +123,14 @@ int main() {
     barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     VkBufferImageCopy copy{}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &copy);
+    VkBufferMemoryBarrier host_read{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    host_read.srcQueueFamilyIndex = host_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host_read.buffer = buf; host_read.offset = 0; host_read.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &host_read, 0, nullptr);
     vkEndCommandBuffer(cb);
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
