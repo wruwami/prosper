@@ -284,6 +284,7 @@ inline std::vector<uint32_t> run_image_copy(const std::vector<uint32_t>& spirv,
             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy down{}; down.bufferRowLength = 0; down.bufferImageHeight = 0;
+    down.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; down.imageExtent = {width, 1, 1};
     vkCmdCopyImageToBuffer(cmd, dstImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &down);
     VkBufferMemoryBarrier host_read{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
