@@ -4,6 +4,9 @@
 
 # prosper
 
+[![CI](https://github.com/wruwami/prosper/actions/workflows/ci.yml/badge.svg)](https://github.com/wruwami/prosper/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/wruwami/prosper/graph/badge.svg)](https://app.codecov.io/gh/wruwami/prosper)
+
 **A user-space PlayStation 5 → PC compatibility layer.** Think *Proton/Wine, but for PS5*: prosper
 runs PS5 (Prospero) game binaries on Linux (primary) and Windows (secondary) by reimplementing the
 console's OS, ABI, and GPU stack on the host — **not** by emulating a CPU.
