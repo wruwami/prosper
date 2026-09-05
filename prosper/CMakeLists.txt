@@ -20,6 +20,16 @@ endif()
 # disabled (stubs compile to no-ops). ON adds ~300 lines of optional code.
 option(PROSPER_DIAGNOSTICS "Enable diagnostics instrumentation (boot timeline, event bus)" OFF)
 
+# --- Code coverage (optional) --------------------------------------------
+# Compiles with gcov profiling instrumentation. OFF by default.
+option(PROSPER_ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
+if(PROSPER_ENABLE_COVERAGE)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(--coverage -fprofile-update=atomic)
+    add_link_options(--coverage)
+  endif()
+endif()
+
 # --- macOS Vulkan (MoltenVK) override ------------------------------------
 # prosper on macOS is built x86_64 (to run the guest under Rosetta), but Homebrew's MoltenVK/loader
 # are arm64-only, so find_package(Vulkan) would hand back an unlinkable arm64 lib. Point the build at
