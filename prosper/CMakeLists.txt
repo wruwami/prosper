@@ -25,7 +25,7 @@ option(PROSPER_DIAGNOSTICS "Enable diagnostics instrumentation (boot timeline, e
 option(PROSPER_ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
 if(PROSPER_ENABLE_COVERAGE)
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(--coverage)
+    add_compile_options(--coverage -fprofile-update=atomic)
     add_link_options(--coverage)
   endif()
 endif()
