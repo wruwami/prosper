@@ -214,6 +214,13 @@ int main() {
     VkBufferImageCopy copy{}; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &copy);
+    VkBufferMemoryBarrier host_read{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    host_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    host_read.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    host_read.srcQueueFamilyIndex = host_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host_read.buffer = rb; host_read.offset = 0; host_read.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &host_read, 0, nullptr);
     vkEndCommandBuffer(cmd);
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
@@ -222,12 +229,8 @@ int main() {
     VKCHECK(vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit (draw)");
     VKCHECK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000), "vkWaitForFences");
 
-    // #3257: this map is a host read of a device write with no availability operation into the host
-    // domain -- the #2944 class, still open here. Waiting the fence above orders EXECUTION only.
-    // Deliberately left for #3257 rather than fixed in passing: the fixtures that carry this pattern
-    // want sweeping together, since one corrected example beside several uncorrected ones is barely
-    // better than none. Neither the pixel assertions below nor synchronization validation can see
-    // it (measured, #2944) -- do not read this file's green run as evidence about that class.
+    // #3257: waiting the fence above orders EXECUTION only; the availability operation into the host
+    // domain is the host_read barrier before vkEndCommandBuffer above (#2944).
     void* mapped = nullptr; vkMapMemory(dev, bmem, 0, bytes, 0, &mapped);
     const uint8_t* px = (const uint8_t*)mapped;
     auto at = [&](uint32_t x, uint32_t y) { return px + ((size_t)y * W + x) * 4; };
