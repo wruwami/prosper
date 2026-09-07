@@ -29,6 +29,17 @@ namespace {
 
 int g_failures = 0;
 
+#if defined(__linux__)
+// A long, distinctive payload in a read-only data mapping.  This exercises the POSIX
+// /proc/self/maps + process_vm_readv half of the API rather than only its pure range scanner.
+const uint8_t kProcessNeedle[] = {
+    0x91, 0x3d, 0xe7, 0x42, 0x18, 0xac, 0x76, 0xf0,
+    0x2b, 0x5e, 0xd4, 0x09, 0xb8, 0x63, 0x4f, 0xca,
+    0x37, 0x82, 0xee, 0x14, 0x59, 0xc6, 0x0a, 0x7d,
+    0xf3, 0x28, 0xa1, 0x6b, 0x44, 0xbd, 0x05, 0x9a,
+};
+#endif
+
 void check(bool ok, const std::string& what) {
     if (!ok) {
         fprintf(stderr, "FAIL: %s\n", what.c_str());
@@ -328,6 +339,33 @@ int main() {
         check(hits.empty() && sc.ranges_scanned == 0, "short range: skipped");
         check(s.fetches == 0, "short range: never fetched");
     }
+
+#if defined(__linux__)
+    // --- 10. The real POSIX enumerator finds a readable mapping and honours skip ---------------
+    // The pure scanner tests above cannot catch a regression in /proc/self/maps parsing or in the
+    // process_vm_readv shim.  Scan only the mapping containing this distinctive fixture so the test
+    // stays bounded and deterministic, then repeat with the fixture excluded as a caller would.
+    {
+        const uint64_t addr = reinterpret_cast<uint64_t>(kProcessNeedle);
+        const uint64_t lo = addr - 1;
+        const uint64_t hi = addr + sizeof(kProcessNeedle) + 1;
+        std::vector<MemorySearchHit> hits;
+        MemorySearchScope sc = guest_memory_search(lo, hi, 0, 0,
+                                                   kProcessNeedle, sizeof(kProcessNeedle),
+                                                   sizeof(kProcessNeedle), 0, 8, hits);
+        check(!sc.enumeration_failed, "posix: readable mapping enumeration succeeded");
+        check(!hits.empty() && hits[0].addr == addr && hits[0].full,
+              "posix: process_vm_readv finds the distinctive fixture");
+
+        std::vector<MemorySearchHit> skipped;
+        MemorySearchScope excluded = guest_memory_search(lo, hi, addr,
+                                                         addr + sizeof(kProcessNeedle),
+                                                         kProcessNeedle, sizeof(kProcessNeedle),
+                                                         sizeof(kProcessNeedle), 0, 8, skipped);
+        check(!excluded.enumeration_failed, "posix/skip: enumeration still succeeded");
+        check(skipped.empty(), "posix/skip: caller-owned buffer is excluded");
+    }
+#endif
 
     if (g_failures) {
         fprintf(stderr, "guest_memory_search: %d failure(s)\n", g_failures);
