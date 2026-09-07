@@ -149,6 +149,20 @@ int main() {
     std::memset(&g_mutex_a, 0, sizeof(g_mutex_a));
     std::memset(&g_mutex_b, 0, sizeof(g_mutex_b));
 
+    // Earthion initializes Ult before creating objects, so the ordering warning in
+    // note_uninitialised() used to be unexecuted.  A valid pool created before initialization is
+    // still supported by prosper: this is a behavior contract, not merely a log-only branch.
+    UltBlob preinit_pool;
+    std::memset(&preinit_pool, 0, sizeof(preinit_pool));
+    const uint64_t preinit_pool_bytes = call(kPoolSize, kNumThreads, kNumSyncObjects);
+    std::vector<unsigned char> preinit_work(
+        preinit_pool_bytes ? (size_t)preinit_pool_bytes : 1, 0xAB);
+    const uint64_t preinit_pool_rc = call7(
+        kPoolCreate, (uint64_t)(uintptr_t)&preinit_pool, 0, kNumThreads, kNumSyncObjects,
+        (uint64_t)(uintptr_t)preinit_work.data(), 0, kApiVersion);
+    CHECK(preinit_pool_rc == 0,
+          "an Ult pool created before sceUltInitialize remains valid and fail-visible");
+
     CHECK(call(kInitialize) == 0, "sceUltInitialize succeeds");
 
     // --- work areas -------------------------------------------------------------------------
