@@ -29,7 +29,7 @@ namespace {
 
 int g_failures = 0;
 
-#ifndef _WIN32
+#if defined(__linux__)
 // A long, distinctive payload in a read-only data mapping.  This exercises the POSIX
 // /proc/self/maps + process_vm_readv half of the API rather than only its pure range scanner.
 const uint8_t kProcessNeedle[] = {
@@ -340,7 +340,7 @@ int main() {
         check(s.fetches == 0, "short range: never fetched");
     }
 
-#ifndef _WIN32
+#if defined(__linux__)
     // --- 10. The real POSIX enumerator finds a readable mapping and honours skip ---------------
     // The pure scanner tests above cannot catch a regression in /proc/self/maps parsing or in the
     // process_vm_readv shim.  Scan only the mapping containing this distinctive fixture so the test
