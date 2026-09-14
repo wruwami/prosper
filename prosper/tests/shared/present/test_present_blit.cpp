@@ -81,6 +81,16 @@ void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout 
     b.srcAccessMask = sa; b.dstAccessMask = da;
     vkCmdPipelineBarrier(cb, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
+
+void host_read_barrier(VkCommandBuffer cb, VkBuffer buf) {
+    VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.buffer = buf; b.offset = 0; b.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &b, 0, nullptr);
+}
 } // namespace
 
 int main() {
@@ -206,6 +216,7 @@ int main() {
             VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             cp.imageExtent = {W, H, 1};
             vkCmdCopyImageToBuffer(consCb, f.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &cp);
+            host_read_barrier(consCb, rb);
             vkEndCommandBuffer(consCb);
             locked_submit_wait(ctx, consCb, consFence);
 
@@ -284,6 +295,7 @@ int main() {
                 vkResetCommandBuffer(prodCb, 0); vkBeginCommandBuffer(prodCb, &bi);
                 VkBufferImageCopy cp2{}; cp2.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp2.imageExtent = {rw, rh, 1};
                 vkCmdCopyImageToBuffer(prodCb, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rrb, 1, &cp2);
+                host_read_barrier(prodCb, rrb);
                 vkEndCommandBuffer(prodCb); locked_submit_wait(ctx, prodCb, prodFence);
                 const uint8_t* out = (const uint8_t*)rrbMap;
                 for (size_t i = 0; i < rdstBytes; i++) if (out[i] != c.expect) { r16_mismatches++; break; }
@@ -362,6 +374,7 @@ int main() {
             vkResetCommandBuffer(consCb, 0); vkBeginCommandBuffer(consCb, &bi);
             VkBufferImageCopy cp{}; cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageExtent = {W, H, 1};
             vkCmdCopyImageToBuffer(consCb, gfA.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rbA, 1, &cp);
+            host_read_barrier(consCb, rbA);
             vkEndCommandBuffer(consCb); locked_submit_wait(ctx, consCb, consFence);
             std::vector<uint8_t> expA((size_t)W * H * 4); fill_pattern(expA.data(), W, H, 777);
             held_mismatch = memcmp(rbAMap, expA.data(), expA.size()) != 0 ? 1 : 0;
