@@ -568,6 +568,32 @@ def test_control_decodes_to_six_instructions():
     ]
 
 
+def mimg(op, nsa=0, w1=0):
+    """MIMG (ISA ch. 13): OP[7] in bit 0, NSA in bits [2:1], OP[6:0] in bits [24:18]."""
+    return [0xF0000000 | ((op & 0x7F) << 18) | (nsa << 1) | (op >> 7), w1]
+
+
+def test_mimg_opcode_top_bit_is_not_nsa():
+    """#5407: bit 0 is OP[7], so IMAGE_MSAA_LOAD (128) and IMAGE_BVH_INTERSECT_RAY (230)
+    are 8 bytes long and linear decoding steps over them to the next instruction."""
+    insns, err = D.decode_program(code(mimg(128), mimg(230), mimg(32), END))
+    assert err is None
+    assert [(i.pc, i.size, i.fmt, i.op) for i in insns] == [
+        (0, 8, "MIMG", 128),
+        (8, 8, "MIMG", 230),
+        (16, 8, "MIMG", 32),
+        (24, 4, "SOPP", 1),
+    ]
+
+
+@pytest.mark.parametrize("nsa", [1, 2, 3])
+def test_mimg_nsa_still_stops_decoding(nsa):
+    """An NSA MIMG appends address dwords this decoder does not model; it stops there."""
+    insns, err = D.decode_program(code(sopp(0), mimg(32, nsa=nsa), END))
+    assert [i.pc for i in insns] == [0]
+    assert err == "MIMG NSA at 0x4: length not modelled"
+
+
 needs_llvm = pytest.mark.skipif(
     not L.llvm_available(), reason="needs llvm-mc/llvm-objdump on PATH, or WSL Ubuntu"
 )
