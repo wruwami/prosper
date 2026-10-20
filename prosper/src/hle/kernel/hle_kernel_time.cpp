@@ -295,12 +295,39 @@ HLE(k_gettimeofday) {                                      // (struct timeval*, 
 }
 HLE(k_time) { uint64_t s = wall_now_us() / 1000000ull; if (a0) *(int64_t*)P(a0) = (int64_t)s; return s; }
 HLE(k_clock) { return ns_now() / 1000; }   // clock(): CLOCKS_PER_SEC=1e6 -> microseconds
+
+// SceRtc ERROR FACILITY. Every libSceRtc handler answers from facility 0x80B5 (shadPS4
+// rtc_error.h; every error return inspected in the shipped libSceRtc.sprx, #4462; the console
+// oracle's rtc.golden.tsv): INVALID_POINTER = ...02, INVALID_VALUE = ...03, per-field
+// year..microsecond = ...08..0E. Failures are sign-extended so int32 and int64 readers both see
+// them as negative.
+// Defined here, ahead of the first libSceRtc handler; the calendar helpers below are declared
+// here too and defined with the rest of the calendar arithmetic further down.
+namespace {
+constexpr uint64_t kRtcErrInvalidPointer = (uint64_t)(int64_t)(int32_t)0x80B50002u;
+constexpr uint64_t kRtcErrInvalidValue = (uint64_t)(int64_t)(int32_t)0x80B50003u;
+constexpr uint64_t kRtcErrInvalidYear = (uint64_t)(int64_t)(int32_t)0x80B50008u;
+constexpr uint64_t kRtcErrInvalidMonth = (uint64_t)(int64_t)(int32_t)0x80B50009u;
+constexpr uint64_t kRtcErrInvalidDay = (uint64_t)(int64_t)(int32_t)0x80B5000Au;
+constexpr uint64_t kRtcErrInvalidHour = (uint64_t)(int64_t)(int32_t)0x80B5000Bu;
+constexpr uint64_t kRtcErrInvalidMinute = (uint64_t)(int64_t)(int32_t)0x80B5000Cu;
+constexpr uint64_t kRtcErrInvalidSecond = (uint64_t)(int64_t)(int32_t)0x80B5000Du;
+constexpr uint64_t kRtcErrInvalidMicrosecond = (uint64_t)(int64_t)(int32_t)0x80B5000Eu;
+constexpr uint64_t kRtcErrBadParse = (uint64_t)(int64_t)(int32_t)0x80B50007u;
+uint64_t rtc_check_valid_dt(const uint16_t* d);
+void rtc_fill_from_tick(void* out, uint64_t tick);
+uint64_t rtc_tick_from_dt(const uint16_t* d);
+}   // namespace
+
 // sceRtcGetCurrentTick(SceRtcTick* tick): a SceRtcTick is a single u64 = microseconds since the Sony RTC
 // epoch 0001-01-01 00:00:00 UTC. Built from the anchored wall clock (#92 — was the frozen synthetic base
 // 1700000000 ≈ Nov 2023) + the RTC↔unix epoch offset. CONFIDENCE: HIGH — SceRtcTick = bare u64 µs and the
 // 62135596800 s offset are the documented Orbis RTC convention (shadPS4 rtc.cpp UNIX_EPOCH_TICKS agrees).
+// A null tick is INVALID_POINTER, as the shipped module answers at +0x1d0 (#4462; this used to
+// return 0). sceRtcGetCurrentNetworkTick shares this handler, so its null answer moved with it;
+// that export's own null path was not read off the module. CONFIDENCE: MED for the network tick.
 HLE(k_rtc_get_current_tick) {
-    if (!a0) return 0;
+    if (!a0) return kRtcErrInvalidPointer;
     *(uint64_t*)P(a0) = wall_now_us() + kRtcUnixEpochOffsetUs;
     return 0;
 }
@@ -374,40 +401,33 @@ HLE(k_rtc_get_clock_utc) {
 // (u64 µs since 0001-01-01, the Orbis RTC convention above). Reference: shadPS4 rtc.cpp
 // sceRtcSetTick (tick - UNIX_EPOCH_TICKS -> gmtime). Unimplemented-0 left the out struct at the
 // caller's zero-init, and UE4's FDateTime(Y:0,M:0,D:0,...) "Invalid Date values" fatal spammed
-// thousands of times during the post-shader-map load (issue #115 follow-on wall). glibc gmtime_r
-// handles pre-1970 (negative time_t) fine, so ticks below the unix epoch still convert.
-// CONFIDENCE: MED-HIGH (shadPS4 reference; struct layout shared with the GetCurrentClock family).
+// thousands of times during the post-shader-map load (issue #115 follow-on wall).
+// The conversion is rtc_fill_from_tick's civil-date arithmetic, not gmtime_r/gmtime_s, whose
+// range depends on the host the way timegm's does (#4502): a tick before 1970 or far in the
+// future may not convert on macOS or Windows (#4462). A null pointer is INVALID_POINTER, as the
+// shipped module answers at +0x27f0 (#4462; this used to return 0x80250001). There is no range
+// check on the tick: none was read off the module, and the gmtime body had none either.
+// CONFIDENCE: MED-HIGH (shadPS4 reference; struct layout shared with the GetCurrentClock family);
+// MED for the absence of a tick range check.
 HLE(k_rtc_set_tick) {   // (SceRtcDateTime* dt, const SceRtcTick* tick)
-    if (!a0 || !a1) return 0x80250001ull;   // SCE_RTC_ERROR_INVALID_POINTER
-    int64_t us = (int64_t)*(const uint64_t*)P(a1) - (int64_t)kRtcUnixEpochOffsetUs;
-    time_t secs = (time_t)(us >= 0 ? us / 1000000ll : (us - 999999ll) / 1000000ll);   // floor
-    int64_t rem = us - (int64_t)secs * 1000000ll;
-    struct tm tmv {};
-#ifdef _WIN32
-    gmtime_s(&tmv, &secs);
-#else
-    gmtime_r(&secs, &tmv);
-#endif
-    fill_rtc_datetime(P(a0), tmv, (uint32_t)rem);
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
+    rtc_fill_from_tick(P(a0), *(const uint64_t*)P(a1));
     return 0;
 }
-namespace {
-int64_t rtc_utc_seconds_carrying(int year, int month, int day, int hour, int minute, int second);
-}
 // sceRtcGetTick(const SceRtcDateTime* dt, SceRtcTick* tick): the inverse (datetime assumed UTC).
-// The seconds come from rtc_utc_seconds_carrying, not from the C library, whose range depends
-// on the host (#4502, from main's CI): glibc's timegm converts every year this handler can be
-// given; macOS's returns -1 for year 1 (it converts year 9999); Windows' _mkgmtime64 returns -1
-// for year 1 and for year 9999. A -1 made this handler answer "one second before 1970". The
-// fields are still not validated and the null error is still the old facility; #4462 tracks
-// both, because changing them changes what a guest sees.
+// The shipped module (+0x2cf0, #4462) refuses a null pointer with INVALID_POINTER, then runs
+// sceRtcCheckValid's per-field checks and writes the tick only when all of them pass. This
+// handler used to answer 0x80250001 for null and to carry out-of-range fields the way timegm
+// carries them (month 13 became January of the next year, February 31 early March), so a
+// guest got a normalized tick where the console returns an error. Validated fields need no
+// carrying, so the conversion is rtc_tick_from_dt's civil-date arithmetic, not the C library,
+// whose range depends on the host (#4502): macOS's timegm and Windows' _mkgmtime64 return -1
+// for year 1, and Windows' also for year 9999.
 HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
-    if (!a0 || !a1) return 0x80250001ull;
+    if (!a0 || !a1) return kRtcErrInvalidPointer;
     const uint16_t* d = (const uint16_t*)P(a0);
-    const int64_t secs =
-        rtc_utc_seconds_carrying((int)d[0], (int)d[1], (int)d[2], (int)d[3], (int)d[4], (int)d[5]);
-    *(uint64_t*)P(a1) = (uint64_t)(secs * 1000000ll + (int64_t)*(const uint32_t*)(d + 6)
-                                   + (int64_t)kRtcUnixEpochOffsetUs);
+    if (const uint64_t bad = rtc_check_valid_dt(d)) return bad;   // output left untouched
+    *(uint64_t*)P(a1) = rtc_tick_from_dt(d);
     return 0;
 }
 
@@ -417,27 +437,13 @@ HLE(k_rtc_get_tick) {   // (const SceRtcDateTime* dt, SceRtcTick* tick)
 // shadPS4 rtc.cpp (signatures, validation order,quirk-compatible formats). Re-derived here
 // against prosper's own tick/datetime core above; three deliberate deviations are marked.
 //
-// ERROR FACILITY. New code uses the evidenced RTC facility 0x80B5 (shadPS4 rtc_error.h):
-// INVALID_POINTER = ...02, INVALID_VALUE = ...03, per-field year..microsecond = ...08..0E.
-// This DISAGREES with the two pre-existing handlers above, which answer 0x80250001 for a null
-// pointer. That older constant is left untouched (changing merged guest-visible behavior needs
-// its own title-impact analysis); the discrepancy is recorded here instead of papered over.
-// New failures are sign-extended so int32 and int64 readers both see them as negative.
+// ERROR FACILITY. All of these use the 0x80B5 constants defined ahead of sceRtcGetCurrentTick
+// above, as the pre-existing Get/SetTick and GetCurrentTick handlers now do too (#4462).
 // Host UTC offset via the TU's own host_local_offset (seconds EAST of UTC at a unix time).
 // prosper has no system timezone setting, so this is the HOST zone including DST — consistent
 // with prosper's own GetCurrentClockLocalTime, which reads the same zone. MED.
 static void host_local_offset(time_t t, long& gmtoff_sec, int& isdst);
 namespace {
-constexpr uint64_t kRtcErrInvalidPointer = (uint64_t)(int64_t)(int32_t)0x80B50002u;
-constexpr uint64_t kRtcErrInvalidValue = (uint64_t)(int64_t)(int32_t)0x80B50003u;
-constexpr uint64_t kRtcErrInvalidYear = (uint64_t)(int64_t)(int32_t)0x80B50008u;
-constexpr uint64_t kRtcErrInvalidMonth = (uint64_t)(int64_t)(int32_t)0x80B50009u;
-constexpr uint64_t kRtcErrInvalidDay = (uint64_t)(int64_t)(int32_t)0x80B5000Au;
-constexpr uint64_t kRtcErrInvalidHour = (uint64_t)(int64_t)(int32_t)0x80B5000Bu;
-constexpr uint64_t kRtcErrInvalidMinute = (uint64_t)(int64_t)(int32_t)0x80B5000Cu;
-constexpr uint64_t kRtcErrInvalidSecond = (uint64_t)(int64_t)(int32_t)0x80B5000Du;
-constexpr uint64_t kRtcErrInvalidMicrosecond = (uint64_t)(int64_t)(int32_t)0x80B5000Eu;
-constexpr uint64_t kRtcErrBadParse = (uint64_t)(int64_t)(int32_t)0x80B50007u;
 // Win32 FILETIME epoch (1601-01-01) in RTC ticks. Pinned against shadPS4's
 // WIN32_FILETIME_EPOCH_TICKS rather than derived silently.
 constexpr uint64_t kRtcWin32EpochOffsetUs = (62135596800ull - 11644473600ull) * 1000000ull;
@@ -466,9 +472,8 @@ uint64_t rtc_check_valid_dt(const uint16_t* d) {
 // Used INSTEAD of gmtime/timegm here: those need a per-OS spelling (#ifdef _WIN32), and new
 // platform branches in shared code trip the arch ratchet. Pure arithmetic has no branches at
 // all, handles pre-1970 dates identically on every host, and is verified below against fixed
-// dates rather than against libc. sceRtcGetTick above uses them too since #4502; sceRtcSetTick
-// still converts through gmtime. The helpers mirror those handlers' results (same epoch offset,
-// same field layout).
+// dates rather than against libc. sceRtcGetTick above uses them too since #4502, and
+// sceRtcSetTick since #4462.
 static int64_t rtc_days_from_civil(int y, int m, int d) {
     y -= m <= 2 ? 1 : 0;
     const int64_t era = (y >= 0 ? y : y - 399) / 400;
@@ -489,22 +494,7 @@ static void rtc_civil_from_days(int64_t z, int& y, int& m, int& d) {
     m = (int)(mp + (mp < 10 ? 3 : -9));
     y += m <= 2 ? 1 : 0;
 }
-// Seconds since 1970-01-01T00:00:00Z for a broken-down UTC datetime whose fields may be out of
-// range, carried the way timegm carries them: months into years, then days, hours, minutes and
-// seconds linearly. So month 13 is January of the next year, month 0 is December of the previous
-// one, and February 31 is early March. test_rtc checks fixed answers on every host and, on
-// glibc, 20,000 arbitrary field tuples against timegm itself.
-int64_t rtc_utc_seconds_carrying(int year, int month, int day, int hour, int minute, int second) {
-    // rtc_days_from_civil wants month 1..12 and counts the day in unsigned arithmetic, so carry
-    // the month first and add the day outside it.
-    const int month0 = month - 1;
-    const int carry = (month0 >= 0 ? month0 : month0 - 11) / 12;   // floor(month0 / 12)
-    const int64_t days =
-        rtc_days_from_civil(year + carry, month0 - carry * 12 + 1, 1) + (int64_t)day - 1;
-    return days * 86400ll + (int64_t)hour * 3600ll + (int64_t)minute * 60ll + (int64_t)second;
-}
-// Tick -> broken-down UTC datetime. Mirrors k_rtc_set_tick's conversion (not shared: that
-// handler's exact body stays untouched).
+// Tick -> broken-down UTC datetime. sceRtcSetTick's conversion, shared with the handlers below.
 void rtc_fill_from_tick(void* out, uint64_t tick) {
     const int64_t us = (int64_t)(tick - kRtcUnixEpochOffsetUs);
     int64_t days = us >= 0 ? us / 86400000000ll : (us - 86400000000ll + 1) / 86400000000ll;
@@ -525,7 +515,8 @@ void rtc_fill_from_tick(void* out, uint64_t tick) {
     for (int i = 0; i < 6; i++) o[i] = f[i];
     *(uint32_t*)(o + 6) = *(const uint32_t*)(f + 6);
 }
-// Broken-down UTC datetime -> tick. Mirrors k_rtc_get_tick's conversion. Caller validates.
+// Broken-down UTC datetime -> tick. sceRtcGetTick's conversion, shared with the handlers below.
+// Caller validates (rtc_check_valid_dt): there is no carrying of out-of-range fields.
 uint64_t rtc_tick_from_dt(const uint16_t* d) {
     const int64_t days = rtc_days_from_civil((int)d[0], (int)d[1], (int)d[2]);
     const int64_t secs =
