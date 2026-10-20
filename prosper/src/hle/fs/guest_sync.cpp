@@ -108,6 +108,38 @@ int guest_sync_close_stream(FILE* stream) {
     return ::fclose(stream);
 }
 
+FILE* guest_sync_reopen_stream(const char* path, const char* mode, FILE* stream, bool writable) {
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    // The host closes the stream's file before opening the new one: keep the barrier's fflush out
+    // of that window, as for fclose. A failed reopen leaves the stream closed and untracked.
+    s.streams.erase(stream);
+    FILE* reopened = ::freopen(path, mode, stream);
+    if (!reopened) return nullptr;
+    const int saved_errno = errno;
+    note_fd_locked(s, ::fileno(reopened));
+    if (writable) s.streams.insert(reopened);
+    errno = saved_errno;
+    return reopened;
+}
+
+FILE* guest_sync_fdopen(int fd, const char* mode, bool writable) {
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    // A stream on a private anchor would close it at fclose, behind the barrier's back.
+    if (private_anchor(s, fd)) {
+        errno = EBADF;
+        return nullptr;
+    }
+    FILE* stream = ::fdopen(fd, mode);
+    if (!stream) return nullptr;
+    const int saved_errno = errno;
+    note_fd_locked(s, fd);
+    if (writable) s.streams.insert(stream);
+    errno = saved_errno;
+    return stream;
+}
+
 int guest_sync_close_fd(int fd) {
     auto& s = state();
     std::lock_guard lock(s.mutex);
@@ -179,6 +211,12 @@ void guest_sync_note_root(const std::string&) {}
 void guest_sync_note_path(const std::string&) {}
 void guest_sync_note_stream(FILE*, bool) {}
 int guest_sync_close_stream(FILE* stream) { return ::fclose(stream); }
+FILE* guest_sync_reopen_stream(const char* path, const char* mode, FILE* stream, bool) {
+    return ::freopen(path, mode, stream);
+}
+FILE* guest_sync_fdopen(int fd, const char* mode, bool) {
+    return ::_fdopen(fd, mode);
+}
 void guest_sync() { (void)::_flushall(); }
 } // namespace prosper
 #endif

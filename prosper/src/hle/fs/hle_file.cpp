@@ -1491,6 +1491,14 @@ HLE(f_dup2) {
     if (fd >= 0) guest_device_copy_fd((int)a0, fd);
     return (uint64_t)(int64_t)fd;
 }
+// fdopen's host half (guest_stdio.cpp). Descriptors 0-2 are prosper's own stdio, whose close
+// f_close ignores, so a stream on one stands on a duplicate that its fclose may close.
+FILE* guest_fd_stream(int fd, const char* mode, bool writable) {
+    const int stream_fd = fd < 3 ? ::fcntl(fd, F_DUPFD, 3) : fd;
+    FILE* f = stream_fd < 0 ? nullptr : guest_sync_fdopen(stream_fd, mode, writable);
+    if (!f && stream_fd >= 0 && stream_fd != fd) ::close(stream_fd);   // a success keeps errno
+    return f;
+}
 #else
 HLE(f_dup) {
     const int fd = windows_duplicate_above_stdio((int)a0);
@@ -1504,6 +1512,19 @@ HLE(f_dup2) {
     // The Windows CRT reports success as zero; the guest/POSIX contract returns the
     // destination descriptor.
     return (uint64_t)(int64_t)(r < 0 ? -1 : (int)a1);
+}
+FILE* guest_fd_stream(int fd, const char* mode, bool writable) {
+    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;   // _fdopen on a closed fd
+    if (windows_directory_path(fd, nullptr)) {
+        // prosper's own directory snapshot, not a CRT descriptor. CONFIDENCE: LOW on EISDIR: a
+        // POSIX host's fdopen accepts a directory descriptor and fails its first read instead.
+        errno = EISDIR;
+        return nullptr;
+    }
+    const int stream_fd = fd < 3 ? windows_duplicate_above_stdio(fd) : fd;
+    FILE* f = stream_fd < 0 ? nullptr : guest_sync_fdopen(stream_fd, mode, writable);
+    if (!f && stream_fd >= 0 && stream_fd != fd) ::_close(stream_fd);
+    return f;
 }
 #endif
 
