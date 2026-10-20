@@ -476,11 +476,16 @@ void http_release_owned(int32_t owner) {  // caller holds g_http_mx
 
 // Epoll handles are opaque host blocks (SceHttpEpollHandle is a pointer type), recorded live
 // with the library context they were created under, so Set/Unset/Destroy/Wait validate against
-// what Create actually handed out and sceHttpTerm can release a context's handles. Caller holds
+// what Create actually handed out and sceHttpTerm can release a context's handles. The entry also
+// carries the block's abort flag, which AbortWait sets and Wait reads. Caller holds
 // g_http_mx throughout.
 constexpr size_t kHttpEpollBlockBytes = 64;
-std::unordered_map<uint64_t, int32_t>& http_epolls() {   // handle -> owning ctx id
-    static std::unordered_map<uint64_t, int32_t> live;
+struct HttpEpoll {
+    int32_t ctx = 0;   // owning library context id
+    bool aborted = false;   // set by sceHttpAbortWaitRequest; sticky until the handle is destroyed
+};
+std::unordered_map<uint64_t, HttpEpoll>& http_epolls() {   // handle -> owner + abort state
+    static std::unordered_map<uint64_t, HttpEpoll> live;
     return live;
 }
 bool http_epoll_live(uint64_t handle) {
@@ -499,8 +504,8 @@ void http_epoll_release(uint64_t handle) {
 }
 void http_epoll_release_owned(int32_t ctx) {
     std::vector<uint64_t> owned;
-    for (const auto& [handle, owner] : http_epolls())
-        if (owner == ctx) owned.push_back(handle);
+    for (const auto& [handle, epoll] : http_epolls())
+        if (epoll.ctx == ctx) owned.push_back(handle);
     for (uint64_t handle : owned) http_epoll_release(handle);
 }
 
@@ -892,7 +897,8 @@ HLE(h_http_create_epoll) {   // (ctxId, HttpEpollHandle* out) -> SCE_OK, handle 
     void* block = std::calloc(1, kHttpEpollBlockBytes);
     if (!block) return http_err(http::kErrorOutOfMemory);
     const uint64_t handle = (uint64_t)(uintptr_t)block;
-    http_epolls()[handle] = (int32_t)a0;
+    // A fresh entry: calloc may hand back the address of a destroyed (possibly aborted) handle.
+    http_epolls()[handle] = HttpEpoll{(int32_t)a0, false};
     *(uint64_t*)a1 = handle;
     return 0;
 }
@@ -907,7 +913,7 @@ HLE(h_http_destroy_epoll) {   // (ctxId, handle) -> SCE_OK
     if (!http_live(a0, Kind::Ctx)) return http_err(http::kErrorInvalidId);
     if (!a1) return http_err(http::kErrorInvalidValue);
     const auto it = http_epolls().find(a1);
-    if (it == http_epolls().end() || it->second != (int32_t)a0)
+    if (it == http_epolls().end() || it->second.ctx != (int32_t)a0)
         return http_err(http::kErrorInvalidId);
     http_epoll_release(a1);
     return 0;
@@ -948,6 +954,11 @@ HLE(h_http_unset_epoll) {   // (id) -> SCE_OK, binding cleared
 // lock, so a caller polling in a loop cannot busy-spin. CONFIDENCE: LOW on the timeout's units
 // (treated as microseconds) and on negative timeouts (unverified; treated as a short bounded wait
 // rather than blocking forever). A zero timeout returns at once. A handle prosper never handed out is refused like a null one.
+// A handle sceHttpAbortWaitRequest has aborted answers ABORTED at once, on every later wait,
+// without sleeping (#4466). A wait that already passed this check when the abort lands finishes
+// its bounded sleep and answers 0 events; the next wait sees the abort. CONFIDENCE: LOW on that
+// in-flight case -- hardware presumably wakes a blocked wait, and what that wait returns has not
+// been read off the module.
 HLE(h_http_wait_epoll) {
     (void)a4;
     (void)a5;
@@ -955,6 +966,9 @@ HLE(h_http_wait_epoll) {
         std::lock_guard<std::mutex> lk(g_http_mx);
         if (!a0 || !a1 || (int32_t)a2 <= 0 || !http_epoll_live(a0))
             return http_id_err(http::kErrorInvalidValue);
+        // The argument checks come first; the inner wait then tests the block's abort flag before
+        // it waits at all (+0x1ab6a -> +0x1ab7a).
+        if (http_epolls().at(a0).aborted) return http_id_err(http::kErrorAborted);
     }
     constexpr int64_t kMaxWaitUs = 50'000;
     const int64_t timeout = (int32_t)a3;
@@ -966,10 +980,13 @@ HLE(h_http_wait_epoll) {
     return 0;
 }
 
-// sceHttpAbortWaitRequest(SceHttpEpollHandle eh) (+0x139c0 -> +0x1fc20): nothing is ever waiting
-// headless longer than the bounded sleep above, so aborting is a validated no-op.
-// CONFIDENCE: LOW on the code for a handle prosper never handed out (treated as INVALID_VALUE,
-// like a null one).
+// sceHttpAbortWaitRequest(SceHttpEpollHandle eh) (+0x139c0 -> +0x1fc20): sets a flag in the
+// epoll block (+0x1fc39, [eh+0x20]=1), and the abort is permanent -- every later
+// sceHttpWaitRequest on the handle answers ABORTED at once (#4466). The flag lives in the block,
+// so only sceHttpDestroyEpoll (or sceHttpTerm of its context) clears it; a handle created
+// afterwards starts unaborted. CONFIDENCE: MED on the semantics, read off the module rather than
+// observed in a title (no local dump imports this NID). CONFIDENCE: LOW on the code for a handle
+// prosper never handed out (treated as INVALID_VALUE, like a null one).
 HLE(h_http_abort_wait_epoll) {
     (void)a1;
     (void)a2;
@@ -977,7 +994,10 @@ HLE(h_http_abort_wait_epoll) {
     (void)a4;
     (void)a5;
     std::lock_guard<std::mutex> lk(g_http_mx);
-    if (!a0 || !http_epoll_live(a0)) return http_err(http::kErrorInvalidValue);
+    if (!a0) return http_err(http::kErrorInvalidValue);
+    const auto it = http_epolls().find(a0);
+    if (it == http_epolls().end()) return http_err(http::kErrorInvalidValue);
+    it->second.aborted = true;
     return 0;
 }
 

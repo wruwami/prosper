@@ -550,10 +550,33 @@ TEST(Http, EpollWaitReportsNoEventsOffline) {
     for (uint8_t b : ev) EXPECT_EQ(b, 0xA5) << "no event record was written";
 
     EXPECT_EQ(abort_wait(0, 0, 0, 0, 0, 0), (uint64_t)http::kErrorInvalidValue);
+    EXPECT_EQ(abort_wait(0xDEADu, 0, 0, 0, 0, 0), (uint64_t)http::kErrorInvalidValue)
+        << "abort refuses a handle nobody handed out";
+    uint64_t sibling = 0;
+    ASSERT_EQ(create(ctx, (uint64_t)&sibling, 0, 0, 0, 0), 0u);
     EXPECT_EQ(abort_wait(eh, 0, 0, 0, 0, 0), 0u);
+
+    // Abort is permanent (#4466): it sets a flag in the epoll block (+0x1fc39), and every later
+    // wait on the handle answers ABORTED at once (+0x1ab6a -> +0x1ab7a) rather than 0 events.
+    const uint64_t kAborted = (uint64_t)(int64_t)(int32_t)http::kErrorAborted;
+    EXPECT_EQ(wait(eh, (uint64_t)ev.data(), 1, 1, 0, 0), kAborted) << "a wait after abort";
+    EXPECT_EQ(wait(eh, (uint64_t)ev.data(), 1, 0, 0, 0), kAborted)
+        << "...and every later one, a zero-timeout poll included";
+    for (uint8_t b : ev) EXPECT_EQ(b, 0xA5) << "an aborted wait writes no event record";
+    EXPECT_EQ(wait(eh, 0, 1, 1, 0, 0), kInvalidValue)
+        << "the argument checks still come before the abort flag";
+    EXPECT_EQ(wait(sibling, (uint64_t)ev.data(), 1, 0, 0, 0), 0u)
+        << "abort is per handle: another handle under the same context still waits";
+
     EXPECT_EQ(destroy(ctx, eh, 0, 0, 0, 0), 0u);
     EXPECT_EQ(wait(eh, (uint64_t)ev.data(), 1, 1, 0, 0), kInvalidValue)
         << "a destroyed handle can no longer be waited on";
+    // The flag lives in the destroyed block. A new handle -- even one calloc places at the freed
+    // address -- starts unaborted.
+    uint64_t fresh = 0;
+    ASSERT_EQ(create(ctx, (uint64_t)&fresh, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(wait(fresh, (uint64_t)ev.data(), 1, 0, 0, 0), 0u)
+        << "a handle created after a destroy does not inherit the abort";
     EXPECT_EQ(term(ctx, 0, 0, 0, 0, 0), 0u);
 }
 
