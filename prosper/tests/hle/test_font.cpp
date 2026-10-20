@@ -275,12 +275,15 @@ TEST(Font, ScaleSlantWeightRoundTrip) {
     using SetWeightFn = int32_t (*)(void*, float, float, uint32_t);
     auto set_weight = reinterpret_cast<SetWeightFn>(Hle::lookup("v0phZwa4R5o"));
     ASSERT_NE(set_weight, nullptr);
-    ASSERT_EQ(set_weight(handle, 1.5f, 2.0f, 7), 0);
+    ASSERT_EQ(set_weight(handle, 1.5f, 2.0f, 0), 0);
+    // A non-zero mode is refused with 0x80460002 and stores nothing (#4498).
+    EXPECT_EQ(static_cast<uint32_t>(set_weight(handle, 3.0f, 3.0f, 7)), 0x80460002u)
+        << "SetEffectWeight refuses a non-zero mode";
     float x = 0.0f, y = 0.0f;
     uint32_t mode = 0;
     ASSERT_EQ(font.get_weight(addr(handle), addr(&x), addr(&y), addr(&mode), 0, 0), 0u);
-    EXPECT_EQ(x, 1.5f) << "GetEffectWeight reports the stored x scale";
-    EXPECT_EQ(y, 2.0f) << "GetEffectWeight reports the stored y scale";
+    EXPECT_EQ(x, 1.5f) << "GetEffectWeight reports the stored x scale, not the refused one";
+    EXPECT_EQ(y, 2.0f) << "GetEffectWeight reports the stored y scale, not the refused one";
     EXPECT_EQ(mode, 0u) << "the firmware getter always reports mode 0; the mode is never stored";
     mode = 9;
     ASSERT_EQ(font.get_render_weight(addr(handle), addr(&x), addr(&y), addr(&mode), 0, 0), 0u);
@@ -1451,4 +1454,180 @@ TEST(Font, CharacterLinksWalkTheirOwnDirectionAndSkipFlagged) {
     EXPECT_EQ(back(addr(&c[3]), 0, 0, 0, 0, 0), addr(&c[0]));
     EXPECT_EQ(next(0, 0, 0, 0, 0, 0), 0u);
     EXPECT_EQ(back(0, 0, 0, 0, 0, 0), 0u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// libSceFont's error classes (#4498). These handlers used to answer 0x8054xxxx, a family the module
+// never returns, and answered a foreign face with the same code as a NULL argument -- so a guest that
+// branches on the code took the wrong branch. Each test pins one class across the handlers that
+// reject that way.
+// ---------------------------------------------------------------------------------------------
+
+// A NULL out-pointer or descriptor is 0x80460002. Every handler below checks that pointer first, so
+// an all-zero call reaches exactly that check.
+TEST(Font, NullOutPointersAreTheInvalidParameterCode) {
+    register_builtin_hle();
+    struct Case {
+        const char* nid;
+        const char* what;
+    };
+    const Case cases[] = {
+        {"whrS4oksXc4", "sceFontMemoryInit: NULL memory descriptor"},
+        {"h6hIgxXEiEc", "sceFontMemoryTerm: NULL memory descriptor"},
+        {"n590hj5Oe-k", "sceFontCreateLibraryWithEdition: NULL out"},
+        {"WaSFJoRWXaI", "sceFontCreateRendererWithEdition: NULL out"},
+        {"nWrfPI4Okmg", "sceFontCreateLibrary: NULL out"},
+        {"u5fZd3KZcs0", "sceFontCreateRenderer: NULL out"},
+        {"cKYtVmeSTcw", "sceFontOpenFontSet: NULL out"},
+        {"KXUpebrFk1U", "sceFontOpenFontMemory: NULL out"},
+        {"L97d+3OgMlE", "sceFontGetCharGlyphMetrics: NULL out"},
+        {"IQtleGLL5pQ", "sceFontGetRenderCharGlyphMetrics: NULL out"},
+        {"imxVx8lm+KM", "sceFontGetHorizontalLayout: NULL out"},
+        {"3BrWWFU+4ts", "sceFontGetVerticalLayout: NULL out"},
+        {"C-4Qw5Srlyw", "sceFontGenerateCharGlyph: NULL out"},
+        {"vRxf4d0ulPs", "sceFontRenderSurfaceSetScissor: NULL surface"},
+        {"oaJ1BpN2FQk", "sceFontTextSourceInit: NULL source"},
+        {"MO24vDhmS4E", "sceFontCreateString: NULL out"},
+    };
+    for (const Case& c : cases) {
+        HleFn fn = Hle::lookup(c.nid);
+        ASSERT_NE(fn, nullptr) << c.what;
+        EXPECT_EQ(fn(0, 0, 0, 0, 0, 0), kErrInvalidParam) << c.what;
+    }
+}
+
+// OpenFontMemory with NULL bytes is the same class. A blob that is not a font is refused too; its
+// exact code is not derived (hle_font.cpp says so), but it must stay in the module's family.
+TEST(Font, OpenFontMemoryRefusalsAnswerTheModuleFamily) {
+    const KerningApi api = kerning_api();
+    ASSERT_TRUE(api.ready());
+    int sentinel = 0;
+    void* handle = &sentinel;
+    EXPECT_EQ(api.open_memory(addr(api.library), 0, 100, 0, addr(&handle), 0), kErrInvalidParam)
+        << "NULL font bytes";
+    EXPECT_EQ(handle, nullptr) << "a refused open clears the out";
+    std::vector<uint8_t> junk(512, 0x5a);
+    handle = &sentinel;
+    const uint64_t rc =
+        api.open_memory(addr(api.library), addr(junk.data()), junk.size(), 0, addr(&handle), 0);
+    EXPECT_NE(rc, 0u) << "a blob that is not a font is refused";
+    EXPECT_EQ(rc & 0xffff0000u, 0x80460000u) << "...with a libSceFont code, not 0x8054xxxx";
+    EXPECT_EQ(handle, nullptr);
+}
+
+// Every face entry point refuses a NULL face or one without the face magic with 0x80460005 and
+// stores nothing. These used to answer 0 (Bind, Unbind, the setters) or 0x80540002 (CloseFont).
+// The decoy is valid memory with the wrong magic, since face() reads through the pointer.
+TEST(Font, FaceEntryPointsRefuseAForeignFace) {
+    const KerningApi api = kerning_api();
+    ASSERT_TRUE(api.ready());
+    HleFn unbind = Hle::lookup("1QjhKxrsOB8");
+    ASSERT_NE(unbind, nullptr);
+    using SetScaleFn = int32_t (*)(void*, float, float);
+    using SetSlantFn = int32_t (*)(void*, float);
+    using SetWeightFn = int32_t (*)(void*, float, float, uint32_t);
+    auto set_pixel = reinterpret_cast<SetScaleFn>(Hle::lookup("N1EBMeGhf7E"));
+    auto set_point = reinterpret_cast<SetScaleFn>(Hle::lookup("sw65+7wXCKE"));
+    auto set_slant = reinterpret_cast<SetSlantFn>(Hle::lookup("TMtqoFQjjbA"));
+    auto set_weight = reinterpret_cast<SetWeightFn>(Hle::lookup("v0phZwa4R5o"));
+    ASSERT_NE(set_pixel, nullptr);
+    ASSERT_NE(set_point, nullptr);
+    ASSERT_NE(set_slant, nullptr);
+    ASSERT_NE(set_weight, nullptr);
+    uint8_t mem[64]{};
+    void* renderer = nullptr;
+    ASSERT_EQ(api.create_renderer(addr(mem), 0, addr(&renderer), 0, 0, 0), 0u);
+
+    uint8_t decoy[64]{};
+    for (void* bad : {static_cast<void*>(decoy), static_cast<void*>(nullptr)}) {
+        const char* what = bad ? "a foreign face" : "a NULL face";
+        EXPECT_EQ(api.bind(addr(bad), addr(renderer), 0, 0, 0, 0), kErrInvalidHandle) << what;
+        EXPECT_EQ(unbind(addr(bad), 0, 0, 0, 0, 0), kErrInvalidHandle) << what;
+        EXPECT_EQ(static_cast<uint32_t>(set_pixel(bad, 20.0f, 20.0f)), kErrInvalidHandle) << what;
+        EXPECT_EQ(static_cast<uint32_t>(set_point(bad, 20.0f, 20.0f)), kErrInvalidHandle) << what;
+        EXPECT_EQ(static_cast<uint32_t>(set_slant(bad, 0.25f)), kErrInvalidHandle) << what;
+        EXPECT_EQ(static_cast<uint32_t>(set_weight(bad, 1.0f, 1.0f, 0)), kErrInvalidHandle) << what;
+    }
+    EXPECT_EQ(api.close(addr(decoy), 0, 0, 0, 0, 0), kErrInvalidHandle)
+        << "CloseFont refuses a foreign face with the face code";
+    EXPECT_TRUE(std::all_of(decoy, decoy + sizeof(decoy), [](uint8_t b) { return b == 0; }))
+        << "nothing was stored through the foreign face";
+
+    // Positive control: the same calls on a real face are accepted.
+    void* face = nullptr;
+    ASSERT_EQ(api.open_set(addr(api.library), 0, 0, 0, addr(&face), 0), 0u);
+    EXPECT_EQ(api.bind(addr(face), addr(renderer), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(unbind(addr(face), 0, 0, 0, 0, 0), 0u);
+    EXPECT_EQ(set_pixel(face, 20.0f, 20.0f), 0);
+    EXPECT_EQ(set_point(face, 20.0f, 20.0f), 0);
+    EXPECT_EQ(set_slant(face, 0.25f), 0);
+    EXPECT_EQ(set_weight(face, 1.0f, 1.0f, 0), 0);
+    EXPECT_EQ(api.close(addr(face), 0, 0, 0, 0, 0), 0u);
+}
+
+// sceFontSetupRenderScalePixel needs a bound renderer, like RebindRenderer and the Render getters:
+// without one it answers 0x80460061 and stores nothing.
+TEST(Font, SetupRenderScalePixelNeedsABoundRenderer) {
+    EXPECT_EQ(nid_hash("sceFontSetupRenderScalePixel"), "6vGCkkQJOcI");
+    const KerningApi api = kerning_api();
+    ASSERT_TRUE(api.ready());
+    const FontState font = font_state();
+    ASSERT_TRUE(font.registered());
+    using SetScaleFn = int32_t (*)(void*, float, float);
+    auto setup = reinterpret_cast<SetScaleFn>(Hle::lookup("6vGCkkQJOcI"));
+    ASSERT_NE(setup, nullptr);
+    void* face = nullptr;
+    ASSERT_EQ(api.open_set(addr(api.library), 0, 0, 0, addr(&face), 0), 0u);
+    EXPECT_EQ(static_cast<uint32_t>(setup(face, 20.0f, 20.0f)), kErrNoRenderer)
+        << "no renderer bound";
+    float w = 0.0f;
+    ASSERT_EQ(font.get_scale(addr(face), addr(&w), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(w, 16.0f) << "a refused setup leaves the new face's default scale";
+    uint8_t mem[64]{};
+    void* renderer = nullptr;
+    ASSERT_EQ(api.create_renderer(addr(mem), 0, addr(&renderer), 0, 0, 0), 0u);
+    ASSERT_EQ(api.bind(addr(face), addr(renderer), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(setup(face, 20.0f, 20.0f), 0) << "with a renderer bound the setup is accepted";
+    ASSERT_EQ(font.get_render_scale(addr(face), addr(&w), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(w, 20.0f) << "...and stored";
+    uint8_t decoy[64]{};
+    EXPECT_EQ(static_cast<uint32_t>(setup(decoy, 20.0f, 20.0f)), kErrInvalidHandle)
+        << "a foreign face is the face code, not the renderer one";
+    EXPECT_EQ(api.close(addr(face), 0, 0, 0, 0, 0), 0u);
+}
+
+// The shared render core behind RenderCharGlyphImage and its Horizontal/Vertical twins separates its
+// refusals: a bad face 0x80460005, code point 0 0x80460041, a NULL surface 0x80460002. They used to
+// be one 0x80540002 for both the face and the surface, and code point 0 was rendered.
+TEST(Font, RenderCharGlyphImageSeparatesFaceCodeAndSurface) {
+    const KerningApi api = kerning_api();
+    ASSERT_TRUE(api.ready());
+    using RenderFn = int32_t (*)(void*, uint32_t, void*, float, float, void*, void*);
+    void* face = nullptr;
+    ASSERT_EQ(api.open_set(addr(api.library), 0, 0, 0, addr(&face), 0), 0u);
+    uint8_t surface[256]{};
+    uint8_t decoy[64]{};
+    for (const char* nid : {"3G4zhgKuxE8", "kAenWy1Zw5o", "i6UNdSig1uE"}) {
+        auto render = reinterpret_cast<RenderFn>(Hle::lookup(nid));
+        ASSERT_NE(render, nullptr) << nid;
+        uint8_t metrics[0x20]{}, result[0x40]{};
+        EXPECT_EQ(static_cast<uint32_t>(render(decoy, 'A', surface, 0.0f, 0.0f, metrics, result)),
+                  kErrInvalidHandle)
+            << nid << ": a foreign face";
+        EXPECT_EQ(static_cast<uint32_t>(render(nullptr, 'A', surface, 0.0f, 0.0f, metrics, result)),
+                  kErrInvalidHandle)
+            << nid << ": a NULL face";
+        std::memset(result, 0xaf, sizeof(result));
+        EXPECT_EQ(static_cast<uint32_t>(render(face, 0, surface, 0.0f, 0.0f, metrics, result)),
+                  kErrNoGlyph)
+            << nid << ": code point 0";
+        EXPECT_TRUE(std::all_of(result, result + sizeof(result), [](uint8_t b) { return b == 0; }))
+            << nid << ": a refused render still clears the result (#2951)";
+        EXPECT_EQ(static_cast<uint32_t>(render(face, 'A', nullptr, 0.0f, 0.0f, metrics, result)),
+                  kErrInvalidParam)
+            << nid << ": a NULL surface";
+        EXPECT_EQ(render(face, 'A', surface, 0.0f, 0.0f, metrics, result), 0)
+            << nid << ": positive control, a real face, code and surface";
+    }
+    EXPECT_EQ(api.close(addr(face), 0, 0, 0, 0, 0), 0u);
 }

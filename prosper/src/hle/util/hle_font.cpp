@@ -52,6 +52,31 @@ constexpr uint64_t kRendererMagic= 0x5052464f4e545244ull; // "PRFONTRD"
 constexpr uint64_t kStringMagic  = 0x5052464f4e545354ull; // "PRFONTST"
 constexpr uint64_t kGlyphMagic = 0x5052464f4e54474cull; // "PRFONTGL"
 
+// libSceFont's own error codes, the 0x8046xxxx family. Every handler in this file answers from it
+// (#4498: the file used to answer 0x8054xxxx, which the module never returns). The generic
+// classes are applied by what a check rejects, and the function-specific checks carry their own
+// evidence at the site:
+//   * a NULL out-pointer or descriptor is 0x80460002 -- the module's class for null out-pointers
+//     (#4498's table). CONFIDENCE: MED per function: the class is read from the module, not every
+//     function's own check.
+//   * a host allocation that fails is 0x80460010, the code the library answers when its own
+//     allocation fails (see font_attach_device_cache). CONFIDENCE: MED.
+//   * a NULL face or one without the face magic is 0x80460005, in every face entry point of the
+//     module (#4498). The metrics and layout getters here still answer a placeholder for one,
+//     because what the module writes to their outputs on that path is not derived.
+constexpr int32_t kFontErrInvalidRenderer = static_cast<int32_t>(0x80460001u);
+constexpr int32_t kFontErrInvalidParam = static_cast<int32_t>(0x80460002u);
+constexpr int32_t kFontErrInvalidLibrary = static_cast<int32_t>(0x80460004u);
+constexpr int32_t kFontErrInvalidHandle = static_cast<int32_t>(0x80460005u);
+constexpr int32_t kFontErrInvalidRendererHandle = static_cast<int32_t>(0x80460007u);
+constexpr int32_t kFontErrInvalidWriting = static_cast<int32_t>(0x8046000Au);
+constexpr int32_t kFontErrNoMemory = static_cast<int32_t>(0x80460010u);
+constexpr int32_t kFontErrCacheAttached = static_cast<int32_t>(0x80460022u);
+constexpr int32_t kFontErrNoCache = static_cast<int32_t>(0x80460025u);
+constexpr int32_t kFontErrInvalidTextSource = static_cast<int32_t>(0x80460008u);
+constexpr int32_t kFontErrNoGlyph = static_cast<int32_t>(0x80460041u);
+constexpr int32_t kFontErrNoRenderer = static_cast<int32_t>(0x80460061u);
+
 struct FontMemory {
     uint16_t kind;
     uint16_t attrs;
@@ -508,7 +533,7 @@ void blit_glyph(const RenderSurface* surf, const uint8_t* glyph, int gw, int gh,
 int32_t font_memory_init(FontMemory* mem, void* region, uint32_t region_size,
                          const void* callbacks, void* mspace, void* destroy,
                          void* destroy_ctx) {
-    if (!mem) return static_cast<int32_t>(0x80540002u);
+    if (!mem) return kFontErrInvalidParam;
     std::memset(mem, 0, sizeof(*mem));
     mem->kind = region ? 1 : 0;
     mem->region_size = region_size;
@@ -525,12 +550,12 @@ const void* font_select_library_ft(int) { return g_ft_selection; }
 const void* font_select_renderer_ft(int) { return g_ft_renderer_selection; }
 
 int32_t font_create_library(const FontMemory*, const void*, uint64_t, void** out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     *out = &g_library;
     return 0;
 }
 int32_t font_create_renderer(const FontMemory*, const void*, uint64_t, void** out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     *out = &g_renderer;
     return 0;
 }
@@ -562,15 +587,15 @@ int32_t font_destroy_library(void** handle) {
 // state left behind. Named rather than pointed at the generic ok-stub so the fact that this is
 // the complete behaviour, and not an unimplemented one, survives in the registry dump.
 int32_t font_memory_term(FontMemory* mem) {
-    if (!mem) return static_cast<int32_t>(0x80540002u);
+    if (!mem) return kFontErrInvalidParam;
     std::memset(mem, 0, sizeof(*mem));
     return 0;
 }
 
 int32_t font_open(void* library, uint64_t, uint64_t, const void*, void** out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     auto* f = new (std::nothrow) FontFace;
-    if (!f) return static_cast<int32_t>(0x80540001u);
+    if (!f) return kFontErrNoMemory;
     f->library = library;
     *out = f;
     return 0;
@@ -584,25 +609,27 @@ int32_t font_open(void* library, uint64_t, uint64_t, const void*, void** out) {
 // A blob we cannot parse is REFUSED, not accepted quietly. Reporting success over a font we did
 // not read is how a caller ends up positioning text with numbers nobody produced -- which is the
 // defect class this whole path was rewritten for (#2951).
+//
+// A NULL bytes pointer is 0x80460002 like a NULL out (CONFIDENCE: MED). The size bounds are
+// prosper's own (kMaxFontBytes), and a blob stb_truetype cannot parse also answers 0x80460002:
+// the module very likely has a dedicated code for font data it cannot read, and it is not derived
+// here. CONFIDENCE: LOW on the code for those three; the refusal itself is the point.
 int32_t font_open_memory(void* library, const void* bytes, uint32_t size,
                          const void* params, void** out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     *out = nullptr;
-    if (!bytes || size < 12 || size > kMaxFontBytes)
-        return static_cast<int32_t>(0x80540002u);
+    if (!bytes || size < 12 || size > kMaxFontBytes) return kFontErrInvalidParam;
 
     auto data = std::make_shared<FontData>();
     try {
         data->bytes.assign(static_cast<const uint8_t*>(bytes),
                            static_cast<const uint8_t*>(bytes) + size);
-    } catch (...) {
-        return static_cast<int32_t>(0x80540001u);
-    }
+    } catch (...) { return kFontErrNoMemory; }
     const int offset = stbtt_GetFontOffsetForIndex(data->bytes.data(), 0);
     if (offset < 0 || !stbtt_InitFont(&data->info, data->bytes.data(), offset))
-        return static_cast<int32_t>(0x80540002u);
+        return kFontErrInvalidParam;
     stbtt_GetFontVMetrics(&data->info, &data->ascent, &data->descent, &data->line_gap);
-    if (data->ascent <= data->descent) return static_cast<int32_t>(0x80540002u);
+    if (data->ascent <= data->descent) return kFontErrInvalidParam;
 
     int32_t rc = font_open(library, 0, 0, params, out);
     if (rc != 0) return rc;
@@ -618,10 +645,13 @@ int32_t font_close(void* handle) {
     // The magic check is not cosmetic any more. FontFace gained a shared_ptr, so it is no longer
     // trivially destructible, and `delete` on a bogus handle would run a refcount decrement
     // through whatever the pointer happens to address -- an arbitrary write, where before this
-    // change the same mistake was only a bad free. Validate first.
+    // change the same mistake was only a bad free. Validate first. A face without the magic is the
+    // face code, 0x80460005 (#4498). A NULL handle still answers 0: #4498 reads "null handle ->
+    // 0x80460005" for every face entry point, but CloseFont's own check is not read, so that case
+    // is left as it was. CONFIDENCE: MED.
     if (!handle) return 0;
     auto* f = face(handle);
-    if (!f) return static_cast<int32_t>(0x80540002u);
+    if (!f) return kFontErrInvalidHandle;
     // Scrub the magic before freeing so a double close is caught by the check above deterministically
     // rather than by luck. It usually would be anyway -- glibc's tcache overwrites the first 16 bytes
     // of a freed chunk -- but "usually, on this allocator" is not a property to rely on.
@@ -630,12 +660,20 @@ int32_t font_close(void* handle) {
     return 0;
 }
 
+// Bind/Unbind and the setters below are face entry points: a NULL or foreign face is refused with
+// 0x80460005 and nothing is stored (#4498). They used to store nothing and answer 0.
+// CONFIDENCE: HIGH on the code (#4498's table covers every face entry point), MED that each of
+// these checks the face before anything else -- the order every face entry point read so far has.
 int32_t font_bind_renderer(void* handle, void* renderer) {
-    if (auto* f = face(handle)) f->renderer = renderer;
+    auto* f = face(handle);
+    if (!f) return kFontErrInvalidHandle;
+    f->renderer = renderer;
     return 0;
 }
 int32_t font_unbind_renderer(void* handle) {
-    if (auto* f = face(handle)) f->renderer = nullptr;
+    auto* f = face(handle);
+    if (!f) return kFontErrInvalidHandle;
+    f->renderer = nullptr;
     return 0;
 }
 // sceFontSetScalePixel / SetScalePoint (native +0xbf70 / +0xbfb0) store the two values as given and
@@ -648,11 +686,11 @@ int32_t set_scale_in(void* handle, float width, float height, uint32_t unit) {
         if (!std::isfinite(v) || v < 1.0f) return fallback;
         return std::min(v, kMaxPixelScale);
     };
-    if (auto* f = face(handle)) {
-        f->width = sane(width, f->width);
-        f->height = sane(height, f->height);
-        f->scale_unit = unit;
-    }
+    auto* f = face(handle);
+    if (!f) return kFontErrInvalidHandle;
+    f->width = sane(width, f->width);
+    f->height = sane(height, f->height);
+    f->scale_unit = unit;
     return 0;
 }
 int32_t font_set_scale(void* handle, float width, float height) {
@@ -661,12 +699,33 @@ int32_t font_set_scale(void* handle, float width, float height) {
 int32_t font_set_scale_point(void* handle, float width, float height) {
     return set_scale_in(handle, width, height, /*unit=*/1);
 }
+// sceFontSetupRenderScalePixel (6vGCkkQJOcI): the module refuses a face with no renderer bound with
+// 0x80460061 (#4498's table; plain-module offset 0xd404) and stores nothing. With one bound it
+// writes the face's render-state block, which prosper keeps as the face state (see the Render
+// getters), so the store is SetScalePixel's. CONFIDENCE: HIGH on the code, MED that the face is
+// checked first, as in RebindRenderer.
+int32_t font_setup_render_scale(void* handle, float width, float height) {
+    const auto* f = face(handle);
+    if (!f) return kFontErrInvalidHandle;
+    if (!f->renderer) return kFontErrNoRenderer;
+    return font_set_scale(handle, width, height);
+}
 int32_t font_set_slant(void* handle, float slant) {
-    if (auto* f = face(handle)) f->slant = slant;
+    auto* f = face(handle);
+    if (!f) return kFontErrInvalidHandle;
+    f->slant = slant;
     return 0;
 }
-int32_t font_set_weight(void* handle, float x, float y, uint32_t) {
-    if (auto* f = face(handle)) { f->weight_x = x; f->weight_y = y; }
+// sceFontSetEffectWeight refuses a non-zero mode with 0x80460002 and stores nothing (#4498's table;
+// plain-module offset 0xab2a), which is why the weight getters always read the mode back as 0.
+// The SetupRender twin shares this handler, so it refuses the same way -- CONFIDENCE: MED for that
+// twin, whose own check is not read.
+int32_t font_set_weight(void* handle, float x, float y, uint32_t mode) {
+    auto* f = face(handle);
+    if (!f) return kFontErrInvalidHandle;
+    if (mode != 0) return kFontErrInvalidParam;
+    f->weight_x = x;
+    f->weight_y = y;
     return 0;
 }
 
@@ -687,14 +746,14 @@ void fill_metrics(void* handle, GlyphMetrics* out) {
 // "Render" variant differs by the render effects in force, and prosper applies none -- no slant,
 // no emboldening -- so the two necessarily agree here. If effects ever become real, they split.
 int32_t font_get_metrics(void* handle, uint32_t code, GlyphMetrics* out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     const auto* f = face(handle);
     if (f && f->data && real_metrics(f, code, out)) return 0;
     fill_metrics(handle, out);
     return 0;
 }
 int32_t font_get_horizontal(void* handle, HorizontalLayout* out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     const auto* f = face(handle);
     float sx = 0.0f, sy = 0.0f;
     if (f && f->data && face_scale(f, &sx, &sy)) {
@@ -714,7 +773,7 @@ int32_t font_get_horizontal(void* handle, HorizontalLayout* out) {
     return 0;
 }
 int32_t font_get_vertical(void* handle, VerticalLayout* out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     const auto* f = face(handle);
     float sx = 0.0f, sy = 0.0f;
     if (f && f->data && face_scale(f, &sx, &sy)) {
@@ -739,7 +798,7 @@ int32_t font_get_vertical(void* handle, VerticalLayout* out) {
 // CONFIDENCE: HIGH on the two offsets and the form check; MED that a NULL block means form 0 on every
 // path (0xde81 does; a font-set face reaches a second store at 0xe389 whose source is not traced).
 int32_t font_generate_glyph(void*, uint32_t, const void* params, void** out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     uint8_t glyph_form = 0, metrics_form = 0;
     if (params) {
         glyph_form = static_cast<const uint8_t*>(params)[6];
@@ -751,7 +810,7 @@ int32_t font_generate_glyph(void*, uint32_t, const void* params, void** out) {
     }
     auto* g = new (std::nothrow) FontGlyph;
     *out = g;
-    if (!g) return static_cast<int32_t>(0x80540001u);
+    if (!g) return kFontErrNoMemory;
     g->glyph_form = glyph_form;
     g->metrics_form = metrics_form;
     return 0;
@@ -778,7 +837,7 @@ void font_surface_init(RenderSurface* out, void* buffer, int width_bytes, int pi
 // `scissor[]`, which is what makes the two agree without a conversion.
 int32_t font_surface_set_scissor(RenderSurface* surface, int32_t x, int32_t y,
                                  int32_t w, int32_t h) {
-    if (!surface) return static_cast<int32_t>(0x80540002u);
+    if (!surface) return kFontErrInvalidParam;
     // Clamping a negative origin to 0 has to take the same amount off the extent, or the rectangle
     // slides instead of being cropped: (-10, 0, 20, 20) is x in [-10,10), and clamping the origin
     // alone would turn it into [0,20) -- twice the requested area, half of it never asked for.
@@ -972,8 +1031,15 @@ int32_t render_glyph(void* handle, uint32_t code, RenderSurface* surface,
     if (result) std::memset(result, 0, sizeof(*result));
     if (metrics) std::memset(metrics, 0, sizeof(*metrics));
 
+    // The argument checks of the module's shared render core (#4498's table): a NULL or foreign face
+    // is the face code 0x80460005, code point 0 is 0x80460041 (plain-module offset 0xfcfd), and a
+    // NULL surface the null-pointer class 0x80460002. CONFIDENCE: HIGH on the face and code-point
+    // codes; MED on the surface's, and on this order, which is the kerning core's (face, code, then
+    // the pointer) rather than one read off this core.
     auto* f = face(handle);
-    if (!f || !surface) return static_cast<int32_t>(0x80540002u);
+    if (!f) return kFontErrInvalidHandle;
+    if (code == 0) return kFontErrNoGlyph;
+    if (!surface) return kFontErrInvalidParam;
     if (result) result->pitch = surface->width_bytes;
 
     // The advance at +0x30 is reported for EVERY glyph the face can describe, before any of the
@@ -997,8 +1063,9 @@ int32_t render_glyph(void* handle, uint32_t code, RenderSurface* surface,
     if (gw > kMaxGlyphDim || gh > kMaxGlyphDim) return 0;   // see kMaxGlyphDim
 
     std::vector<uint8_t> bitmap;
-    try { bitmap.assign((size_t)gw * (size_t)gh, 0); }
-    catch (...) { return static_cast<int32_t>(0x80540001u); }
+    try {
+        bitmap.assign((size_t)gw * (size_t)gh, 0);
+    } catch (...) { return kFontErrNoMemory; }
     stbtt_MakeCodepointBitmap(&f->data->info, bitmap.data(), gw, gh, gw, sx, sy, (int)code);
 
     const float baseline = face_baseline(f, sy);
@@ -1006,7 +1073,9 @@ int32_t render_glyph(void* handle, uint32_t code, RenderSurface* surface,
     // origin, which is what a single-glyph-per-surface caller like Metaphor asks for anyway.
     const float ox = have_pen ? pen_x : -m.h_bearing_x;
     const float oy = have_pen ? pen_y : (m.h_bearing_y - baseline);
-    if (!std::isfinite(ox) || !std::isfinite(oy)) return static_cast<int32_t>(0x80540002u);
+    // A non-finite pen is prosper's own guard (it feeds lround below); whether the module checks
+    // the pen at all is not read. CONFIDENCE: LOW on the code.
+    if (!std::isfinite(ox) || !std::isfinite(oy)) return kFontErrInvalidParam;
     const double left = (double)ox + (double)m.h_bearing_x;
     const double top  = (double)oy + (double)baseline - (double)m.h_bearing_y;
     if (std::fabs(left) > 1e7 || std::fabs(top) > 1e7) return 0;   // pen nowhere near the surface
@@ -1057,7 +1126,7 @@ int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code, Ren
 // Horizontal export (0xbd50) except for the orientation word it stores (2, not 1) before the shared
 // core, which then places the glyph with the VERTICAL bearings (metrics +0x14/+0x18); prosper's
 // renderer has no vertical placement, so this draws with horizontal placement. Its argument checks
-// are therefore the Horizontal twin's, and both still answer this file's 0x8054xxxx codes (#4498).
+// are therefore the Horizontal twin's: render_glyph's.
 // No local title imports it. CONFIDENCE: HIGH on the signature, LOW on placement.
 // sceFontCreateLibrary (0xd70) / sceFontCreateRenderer (0xa430) move the out-pointer from rdx to
 // rcx, zero the edition and tail-jump to the WithEdition export, so these wrappers only shift the
@@ -1071,8 +1140,7 @@ int32_t font_render_char_glyph_image_horizontal(void* handle, uint32_t code, Ren
 // 0x6ce0): a NULL or invalid handle answers 0x80460005 and zeroes every non-NULL output (weight:
 // 1.0, 1.0, mode 0); otherwise each non-NULL output is written and 0x80460002 is answered only when
 // ALL outputs are NULL. The weight mode always reads back 0 (the setter rejects a non-zero mode and
-// never stores it). These use the module's 0x8046xxxx codes; the rest of this file still answers
-// 0x8054xxxx (#4498).
+// never stores it).
 // The Render-prefixed twins (RenderScalePixel 0x95d0, RenderScalePoint 0x96a0, RenderEffectSlant
 // 0x9b70, RenderEffectWeight 0x99e0) differ in one check: with no renderer bound to the face they
 // answer 0x80460061 and zero their outputs like a failed handle. With a renderer bound they read the
@@ -1090,18 +1158,6 @@ int32_t font_create_library_plain(const FontMemory* memory, const void* params, 
 int32_t font_create_renderer_plain(const FontMemory* memory, const void* params, void** out) {
     return font_create_renderer(memory, params, 0, out);
 }
-constexpr int32_t kFontErrInvalidRenderer = static_cast<int32_t>(0x80460001u);
-constexpr int32_t kFontErrInvalidParam = static_cast<int32_t>(0x80460002u);
-constexpr int32_t kFontErrInvalidLibrary = static_cast<int32_t>(0x80460004u);
-constexpr int32_t kFontErrInvalidHandle = static_cast<int32_t>(0x80460005u);
-constexpr int32_t kFontErrInvalidRendererHandle = static_cast<int32_t>(0x80460007u);
-constexpr int32_t kFontErrInvalidWriting = static_cast<int32_t>(0x8046000Au);
-constexpr int32_t kFontErrNoMemory = static_cast<int32_t>(0x80460010u);
-constexpr int32_t kFontErrCacheAttached = static_cast<int32_t>(0x80460022u);
-constexpr int32_t kFontErrNoCache = static_cast<int32_t>(0x80460025u);
-constexpr int32_t kFontErrInvalidTextSource = static_cast<int32_t>(0x80460008u);
-constexpr int32_t kFontErrNoGlyph = static_cast<int32_t>(0x80460041u);
-constexpr int32_t kFontErrNoRenderer = static_cast<int32_t>(0x80460061u);
 int32_t font_rebind_renderer(void* handle) {
     const auto* f = face(handle);
     if (!f) return kFontErrInvalidHandle;
@@ -1487,13 +1543,12 @@ int32_t font_get_library(void* handle, void** out) {
     return 0;
 }
 
-// TextSourceInit stamps the magic and the default writing form and takes the rewind snapshot. Its
-// argument checks are unchanged from before: the native module also refuses a NULL parser
-// (0x80460002, zeroing the source), which prosper does not model -- CONFIDENCE: MED that no title
-// depends on that.
+// TextSourceInit stamps the magic and the default writing form and takes the rewind snapshot. A NULL
+// source is 0x80460002. The native module also refuses a NULL parser (0x80460002, zeroing the
+// source), which prosper does not model -- CONFIDENCE: MED that no title depends on that.
 int32_t font_text_source_init(TextSource* out, const void* text, uint32_t size,
                               void* parser, void* object) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     std::memset(out, 0, sizeof(*out));
     out->magic = kTextSourceMagic;
     out->writing_form = 0x10;
@@ -1543,9 +1598,9 @@ int32_t font_text_source_rewind(TextSource* source) {
 }
 
 int32_t font_create_string(const FontMemory*, TextSource*, const void*, void** out) {
-    if (!out) return static_cast<int32_t>(0x80540002u);
+    if (!out) return kFontErrInvalidParam;
     *out = new (std::nothrow) FontString;
-    return *out ? 0 : static_cast<int32_t>(0x80540001u);
+    return *out ? 0 : kFontErrNoMemory;
 }
 int32_t font_destroy_string(void** string) {
     if (string) {
@@ -1679,7 +1734,7 @@ void register_font_hle() {
     R("VRFd3diReec", (HleFn)font_text_source_rewind, "sceFontTextSourceRewind");
     R("6Gqlv5KdTbU", (HleFn)font_character_back, "sceFontCharacterRefersTextBack");
     Hle::register_typed("N1EBMeGhf7E", font_set_scale, "sceFontSetScalePixel");
-    Hle::register_typed("6vGCkkQJOcI", font_set_scale, "sceFontSetupRenderScalePixel");
+    Hle::register_typed("6vGCkkQJOcI", font_setup_render_scale, "sceFontSetupRenderScalePixel");
     Hle::register_typed("TMtqoFQjjbA", font_set_slant, "sceFontSetEffectSlant");
     Hle::register_typed("lz9y9UFO2UU", font_set_slant, "sceFontSetupRenderEffectSlant");
     Hle::register_typed("v0phZwa4R5o", font_set_weight, "sceFontSetEffectWeight");
