@@ -290,33 +290,118 @@ TEST(Rtc, GetTickIsTheSameOnEveryHost) {
     // 0001-01-01 to 10000-01-01 is 3,652,059 days; the last microsecond of year 9999 is one less.
     EXPECT_EQ(tick_of(ymd(9999, 12, 31, 23, 59, 59, 999999)), 3652059ull * kDay - 1ull)
         << "year 9999, where a 32-bit-era or bounded timegm gives up";
+    EXPECT_EQ(tick_of(ymd(2000, 2, 29)), 63087379200000000ull) << "the leap day of a 400th year";
+    EXPECT_EQ(tick_of(ymd(2024, 1, 1, 23, 59, 59, 999999)), kTick20240101 + kDay - 1ull)
+        << "the last microsecond of a day";
+    // Out-of-range fields used to carry here, the way timegm carries them; since #4462 they are
+    // refused instead (GetTickRefusesWhatCheckValidRefuses below).
+}
 
-    // The handler does not validate (#4462 tracks that), so an out-of-range field carries, as
-    // timegm carries it. Each expectation is a valid date's fixed tick.
-    EXPECT_EQ(tick_of(ymd(2023, 13, 1)), kTick20240101) << "month 13 is January of the next year";
-    EXPECT_EQ(tick_of(ymd(2024, 0, 1)), kTick20240101 - 31ull * kDay) << "month 0 is December";
-    EXPECT_EQ(tick_of(ymd(2022, 25, 1)), kTick20240101)
-        << "month 25 carries two whole years (the civil-day formula alone stops at month 14)";
-    EXPECT_EQ(tick_of(ymd(2024, 2, 31)), kTick20240101 + (31ull + 29ull + 1ull) * kDay)
-        << "February 31 of a leap year is March 2";
-    EXPECT_EQ(tick_of(ymd(2024, 1, 0)), kTick20240101 - kDay) << "day 0 is the day before";
-    // Day 0 of March in a year divisible by 400: the day must be added OUTSIDE the civil-day
-    // formula, whose unsigned day count would wrap here and nowhere else in this list.
-    EXPECT_EQ(tick_of(ymd(2000, 3, 0)), 63087379200000000ull) << "2000-03-00 is February 29";
-    EXPECT_EQ(tick_of(ymd(2024, 1, 1, 25, 61, 61)),
-              kTick20240101 + (25ull * 3600ull + 61ull * 60ull + 61ull) * 1000000ull)
-        << "hours, minutes and seconds carry linearly";
-    EXPECT_EQ(tick_of(ymd(0, 1, 1)), (uint64_t)(-366ll * (int64_t)kDay))
-        << "year 0 is a leap year before the epoch; the tick wraps as it always did";
+// #4462: the shipped module's sceRtcGetTick (+0x2cf0) runs sceRtcCheckValid's per-field checks
+// and writes the tick only when all of them pass. prosper used to carry an out-of-range field
+// into a different, valid date (month 13 -> January of the next year, February 30 -> March 1)
+// and answer SCE_OK, so a guest that relies on the error got a plausible wrong tick instead.
+TEST(Rtc, GetTickRefusesWhatCheckValidRefuses) {
+    register_builtin_hle();
+    HleFn get_tick = Hle::lookup(nid_hash("sceRtcGetTick"));
+    ASSERT_NE(get_tick, nullptr);
+    constexpr uint64_t kSentinel = 0x5A5A5A5A5A5A5A5Aull;
+    const auto refusal_of = [&](DateTime t) {
+        uint64_t tick = kSentinel;
+        const uint64_t rc = get_tick(addr(&t), addr(&tick), 0, 0, 0, 0);
+        EXPECT_EQ(tick, kSentinel) << "a refused datetime must leave the output untouched";
+        return rc;
+    };
+    EXPECT_EQ(refusal_of(ymd(2024, 2, 30)), sx(0x80B5000Au)) << "February 30 never exists";
+    EXPECT_EQ(refusal_of(ymd(2023, 2, 29)), sx(0x80B5000Au)) << "Feb 29 of a common year";
+    EXPECT_EQ(refusal_of(ymd(2024, 1, 0)), sx(0x80B5000Au)) << "day 0";
+    EXPECT_EQ(refusal_of(ymd(0, 1, 1)), sx(0x80B50008u)) << "year 0";
+    EXPECT_EQ(refusal_of(ymd(10000, 1, 1)), sx(0x80B50008u)) << "year 10000";
+    EXPECT_EQ(refusal_of(ymd(2024, 0, 1)), sx(0x80B50009u)) << "month 0";
+    EXPECT_EQ(refusal_of(ymd(2023, 13, 1)), sx(0x80B50009u)) << "month 13";
+    EXPECT_EQ(refusal_of(ymd(2024, 1, 1, 24)), sx(0x80B5000Bu)) << "hour 24";
+    EXPECT_EQ(refusal_of(ymd(2024, 1, 1, 0, 60)), sx(0x80B5000Cu)) << "minute 60";
+    EXPECT_EQ(refusal_of(ymd(2024, 1, 1, 0, 0, 60)), sx(0x80B5000Du)) << "second 60";
+    EXPECT_EQ(refusal_of(ymd(2024, 1, 1, 0, 0, 0, 1000000u)), sx(0x80B5000Eu)) << "microsecond 1e6";
+    // Positive control for the sentinel check: the neighbouring valid date is written.
+    DateTime leap_day = ymd(2024, 2, 29);
+    uint64_t tick = kSentinel;
+    ASSERT_EQ(get_tick(addr(&leap_day), addr(&tick), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(tick, 63844761600000000ull) << "2024-02-29T00:00:00Z";
+}
+
+// #4462: a null pointer is SCE_RTC_ERROR_INVALID_POINTER (0x80B50002) in all three handlers, as
+// it is everywhere else in the shipped module. prosper answered 0x80250001 (another facility)
+// from SetTick and GetTick, and SCE_OK from GetCurrentTick, which reads as "the tick was
+// written" to a caller that checks only the return value.
+TEST(Rtc, TickHandlersRefuseNullWithInvalidPointer) {
+    register_builtin_hle();
+    HleFn get_tick = Hle::lookup(nid_hash("sceRtcGetTick"));
+    HleFn set_tick = Hle::lookup(nid_hash("sceRtcSetTick"));
+    HleFn current = Hle::lookup(nid_hash("sceRtcGetCurrentTick"));
+    for (HleFn f : {get_tick, set_tick, current}) ASSERT_NE(f, nullptr);
+    constexpr uint64_t kSentinel = 0x5A5A5A5A5A5A5A5Aull;
+    EXPECT_EQ(current(0, 0, 0, 0, 0, 0), sx(0x80B50002u)) << "GetCurrentTick: null tick";
+    DateTime dt = ymd(2024, 1, 1);
+    uint64_t tick = kSentinel;
+    EXPECT_EQ(get_tick(0, addr(&tick), 0, 0, 0, 0), sx(0x80B50002u)) << "GetTick: null datetime";
+    EXPECT_EQ(tick, kSentinel) << "and no write";
+    EXPECT_EQ(get_tick(addr(&dt), 0, 0, 0, 0, 0), sx(0x80B50002u)) << "GetTick: null tick";
+    const uint64_t in = kTick20240101;
+    DateTime out = ymd(1234, 5, 6, 7, 8, 9, 10);
+    EXPECT_EQ(set_tick(0, addr(&in), 0, 0, 0, 0), sx(0x80B50002u)) << "SetTick: null datetime";
+    EXPECT_EQ(set_tick(addr(&out), 0, 0, 0, 0, 0), sx(0x80B50002u)) << "SetTick: null tick";
+    EXPECT_EQ(out.year, 1234u) << "and no write";
+    EXPECT_EQ(out.microsecond, 10u) << "and no write";
+    // Positive control: the same calls with both pointers present succeed and write.
+    ASSERT_EQ(current(addr(&tick), 0, 0, 0, 0, 0), 0u);
+    EXPECT_NE(tick, kSentinel);
+    ASSERT_EQ(set_tick(addr(&out), addr(&in), 0, 0, 0, 0), 0u);
+    EXPECT_EQ(out.year, 2024u);
+}
+
+// sceRtcSetTick must give the same datetime on every host. It converted through gmtime_r /
+// gmtime_s, whose range depends on the host the way timegm's does (#4502), and the only test
+// that called it stayed inside 2023-2028 (#4462). Fixed answers, not a comparison against libc.
+TEST(Rtc, SetTickIsTheSameOnEveryHost) {
+    register_builtin_hle();
+    HleFn set_tick = Hle::lookup(nid_hash("sceRtcSetTick"));
+    ASSERT_NE(set_tick, nullptr);
+    const auto expect_dt = [&](uint64_t tick, DateTime want, const char* what) {
+        DateTime got = ymd(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFFFFFFu);
+        ASSERT_EQ(set_tick(addr(&got), addr(&tick), 0, 0, 0, 0), 0u) << what;
+        EXPECT_EQ(got.year, want.year) << what;
+        EXPECT_EQ(got.month, want.month) << what;
+        EXPECT_EQ(got.day, want.day) << what;
+        EXPECT_EQ(got.hour, want.hour) << what;
+        EXPECT_EQ(got.minute, want.minute) << what;
+        EXPECT_EQ(got.second, want.second) << what;
+        EXPECT_EQ(got.microsecond, want.microsecond) << what;
+    };
+    constexpr uint64_t kDay = 86400000000ull;
+    expect_dt(0u, ymd(1, 1, 1), "tick 0 is the RTC epoch, year 1");
+    expect_dt(3652059ull * kDay - 1ull, ymd(9999, 12, 31, 23, 59, 59, 999999),
+              "the last microsecond of year 9999");
+    expect_dt(62135596800000000ull, ymd(1970, 1, 1), "the unix epoch");
+    expect_dt(62135596800000000ull - 1ull, ymd(1969, 12, 31, 23, 59, 59, 999999),
+              "one microsecond before the unix epoch");
+    expect_dt(0xb36168b6a58000ull, ymd(1601, 1, 1), "before 1970: the FILETIME epoch");
+    expect_dt(kTick20240101 + 1ull, ymd(2024, 1, 1, 0, 0, 0, 1), "2024-01-01 plus 1 us");
 }
 
 #ifdef __GLIBC__
 // The same handler against glibc's own timegm over arbitrary field values: on Linux, where every
-// title has run so far, replacing the libc call must not change a single tick.
+// title has run so far, the civil-date conversion must not change a single tick of a valid date.
+// Since #4462 an invalid date is refused with sceRtcCheckValid's error and no write. Validity is
+// judged independently of prosper: timegm normalizes the struct in place, so a datetime is valid
+// exactly when its year is 1..9999 and timegm leaves every field as it was.
 TEST(Rtc, GetTickMatchesGlibcTimegmForArbitraryFields) {
     register_builtin_hle();
     HleFn get_tick = Hle::lookup(nid_hash("sceRtcGetTick"));
+    HleFn check = Hle::lookup(nid_hash("sceRtcCheckValid"));
     ASSERT_NE(get_tick, nullptr);
+    ASSERT_NE(check, nullptr);
+    int valid = 0, invalid = 0;
     uint32_t state = 0x4502u;
     const auto next = [&](uint32_t bound) {
         state = state * 1664525u + 1013904223u;
@@ -344,13 +429,31 @@ TEST(Rtc, GetTickMatchesGlibcTimegmForArbitraryFields) {
         tmv.tm_min = (int)t.minute;
         tmv.tm_sec = (int)t.second;
         const int64_t secs = (int64_t)timegm(&tmv);
-        const uint64_t want =
-            (uint64_t)(secs * 1000000ll + (int64_t)t.microsecond + 62135596800000000ll);
-        uint64_t got = 0;
-        ASSERT_EQ(get_tick(addr(&t), addr(&got), 0, 0, 0, 0), 0u);
-        ASSERT_EQ(got, want) << t.year << "-" << t.month << "-" << t.day << " " << t.hour << ":"
-                             << t.minute << ":" << t.second;
+        const bool is_valid = t.year >= 1 && t.year <= 9999 && tmv.tm_year == (int)t.year - 1900 &&
+                              tmv.tm_mon == (int)t.month - 1 && tmv.tm_mday == (int)t.day &&
+                              tmv.tm_hour == (int)t.hour && tmv.tm_min == (int)t.minute &&
+                              tmv.tm_sec == (int)t.second;
+        constexpr uint64_t kSentinel = 0x5A5A5A5A5A5A5A5Aull;
+        uint64_t got = kSentinel;
+        const uint64_t rc = get_tick(addr(&t), addr(&got), 0, 0, 0, 0);
+        if (is_valid) {
+            ++valid;
+            const uint64_t want =
+                (uint64_t)(secs * 1000000ll + (int64_t)t.microsecond + 62135596800000000ll);
+            ASSERT_EQ(rc, 0u) << t.year << "-" << t.month << "-" << t.day;
+            ASSERT_EQ(got, want) << t.year << "-" << t.month << "-" << t.day << " " << t.hour << ":"
+                                 << t.minute << ":" << t.second;
+        } else {
+            ++invalid;
+            ASSERT_NE(rc, 0u) << "invalid " << t.year << "-" << t.month << "-" << t.day << " "
+                              << t.hour << ":" << t.minute << ":" << t.second;
+            ASSERT_EQ(rc, check(addr(&t), 0, 0, 0, 0, 0)) << "GetTick refuses as CheckValid does";
+            ASSERT_EQ(got, kSentinel) << "a refused datetime must leave the output untouched";
+        }
     }
+    // Both arms must actually run, or a pass says nothing about one of them.
+    EXPECT_GT(valid, 1000) << "valid datetimes drawn";
+    EXPECT_GT(invalid, 1000) << "invalid datetimes drawn";
 }
 #endif
 
