@@ -39,6 +39,11 @@ constexpr uint32_t kErrorInvalidId = 0x80431100u;
 // an error constant of this facility.
 constexpr uint32_t kErrorBeforeInit = 0x80431001u;
 
+// What sceHttpWaitRequest answers, at once, on an epoll handle sceHttpAbortWaitRequest has
+// aborted (#4466). CONFIDENCE: HIGH on the value -- the #4442 review read it off the wait's
+// abort-flag branch in the shipped module (+0x1ab6a -> +0x1ab7a); MED on the ABORTED name.
+constexpr uint32_t kErrorAborted = 0x80431080u;
+
 // What the request path answers offline (#2930) is NOT an HTTP error: the libSceHttp family
 // propagates the raw libSceNet error out of a failed connect, so it is net::kNetErrorNetUnreach
 // from hle/net/sce_net_errors.hpp, which owns that facility for every library (#3545).
