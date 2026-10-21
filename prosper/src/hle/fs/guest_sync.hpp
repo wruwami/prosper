@@ -14,6 +14,11 @@ void guest_sync_note_root(const std::string& root);
 void guest_sync_note_path(const std::string& path);
 void guest_sync_note_stream(FILE* stream, bool writable);
 int guest_sync_close_stream(FILE* stream);
+// freopen(3) and fdopen(3) for the guest. Like close, a reopen is serialized with the barrier's
+// flush, and the stream it returns is tracked when `writable`. fdopen refuses a private retention
+// descriptor with EBADF, as guest_sync_close_fd does.
+FILE* guest_sync_reopen_stream(const char* path, const char* mode, FILE* stream, bool writable);
+FILE* guest_sync_fdopen(int fd, const char* mode, bool writable);
 // Private retention descriptors are not guest handles. Reject closes of those slots and
 // relocate an anchor before dup2 replaces its slot, preserving the guest's requested number.
 int guest_sync_close_fd(int fd);

@@ -8,7 +8,7 @@
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/fs/save_paths.hpp"
 #include "hle/fs/guest_sync.hpp"
-#include "hle/fs/guest_fopen_mode.hpp"
+#include "hle/fs/guest_stdio.hpp"
 #include "hle/fs/guest_devices.hpp"   // #4782 review: the served /dev/urandom and /dev/random
 #include "hle/service/hle_addcontent.hpp"
 #include "hle/service/hle_loadexec.hpp"
@@ -1196,37 +1196,20 @@ void to_sce_stat64(const struct _stat64& s, uint8_t* out) {
 #endif
 
 // --- stdio FILE* ---
-// The guest's mode string follows its libc's (Dinkumware `_Foprep`) grammar, not the host's: parse
-// it once and hand the host a spelling it accepts (guest_fopen_mode.hpp — on Windows a verbatim "r"
-// opened in TEXT mode). Reached only by titles that ship no libc.prx; see that header's scope note.
-HLE(f_fopen) {
-    const char* mode = CS(a1);
-    const GuestFopenMode m = parse_guest_fopen_mode(mode, kHostFopenDialect);
-    if (!m.valid) {
-        if (filelog())
-            fprintf(stderr, "[file] fopen mode='%s' -> EINVAL\n", mode ? mode : "(null)");
-        errno = EINVAL;
-        return 0;
-    }
-    const GuestPath g = resolve_guest(CS(a0));
-    if (g.device()) {
-        // The host stdio stream would read the null backing object, not entropy. This handler is
-        // reached only by titles that ship no libc.prx (none locally; see guest_fopen_mode.hpp),
-        // so refuse visibly rather than serve an empty "random" stream. CONFIDENCE: LOW.
-        errno = ENODEV;
-        return 0;
-    }
-    if (!g.mapped()) {
-        errno = unmapped_errno(g, m.create ? GuestPathOp::Modify : GuestPathOp::Lookup);
-        return 0;
-    }
-    const std::string& h = g.host;
-    FILE* f = fopen(h.c_str(), m.host);
-    guest_sync_note_stream(f, m.writable);
-    if (filelog())
-        fprintf(stderr, "[file] fopen host='%s' mode='%s' (host '%s') -> %p error=%d\n", h.c_str(),
-                mode, m.host, (void*)f, f ? 0 : errno);
-    return (uint64_t)(uintptr_t)f;
+// fopen and the rest of the open family live in guest_stdio.cpp; these are the answers it needs
+// from this file's mount table. A served device is refused with ENODEV: the host stdio stream would
+// read the null backing object, not entropy. This is reached only by titles that ship no libc.prx
+// (none locally; see guest_fopen_mode.hpp), so refuse visibly rather than serve an empty "random"
+// stream. CONFIDENCE: LOW.
+bool guest_file_log_enabled() {
+    return filelog();
+}
+int guest_stream_host_path(const char* guest, bool create, std::string& host) {
+    const GuestPath g = resolve_guest(guest);
+    if (g.device()) return ENODEV;
+    if (!g.mapped()) return unmapped_errno(g, create ? GuestPathOp::Modify : GuestPathOp::Lookup);
+    host = g.host;
+    return 0;
 }
 HLE(f_fclose)  { return a0 ? (uint64_t)(int64_t)guest_sync_close_stream((FILE*)P(a0)) : 0; }
 HLE(f_fread)   { if (!a3) return 0;
@@ -1508,6 +1491,14 @@ HLE(f_dup2) {
     if (fd >= 0) guest_device_copy_fd((int)a0, fd);
     return (uint64_t)(int64_t)fd;
 }
+// fdopen's host half (guest_stdio.cpp). Descriptors 0-2 are prosper's own stdio, whose close
+// f_close ignores, so a stream on one stands on a duplicate that its fclose may close.
+FILE* guest_fd_stream(int fd, const char* mode, bool writable) {
+    const int stream_fd = fd < 3 ? ::fcntl(fd, F_DUPFD, 3) : fd;
+    FILE* f = stream_fd < 0 ? nullptr : guest_sync_fdopen(stream_fd, mode, writable);
+    if (!f && stream_fd >= 0 && stream_fd != fd) ::close(stream_fd);   // a success keeps errno
+    return f;
+}
 #else
 HLE(f_dup) {
     const int fd = windows_duplicate_above_stdio((int)a0);
@@ -1521,6 +1512,19 @@ HLE(f_dup2) {
     // The Windows CRT reports success as zero; the guest/POSIX contract returns the
     // destination descriptor.
     return (uint64_t)(int64_t)(r < 0 ? -1 : (int)a1);
+}
+FILE* guest_fd_stream(int fd, const char* mode, bool writable) {
+    ScopedCrtInvalidParameterHandler suppress_invalid_parameter;   // _fdopen on a closed fd
+    if (windows_directory_path(fd, nullptr)) {
+        // prosper's own directory snapshot, not a CRT descriptor. CONFIDENCE: LOW on EISDIR: a
+        // POSIX host's fdopen accepts a directory descriptor and fails its first read instead.
+        errno = EISDIR;
+        return nullptr;
+    }
+    const int stream_fd = fd < 3 ? windows_duplicate_above_stdio(fd) : fd;
+    FILE* f = stream_fd < 0 ? nullptr : guest_sync_fdopen(stream_fd, mode, writable);
+    if (!f && stream_fd >= 0 && stream_fd != fd) ::_close(stream_fd);
+    return f;
 }
 #endif
 
@@ -4901,7 +4905,10 @@ HLE(f_apr_measure_read_file) {
 
 void register_file_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
-    R("fopen", f_fopen);   R("fclose", f_fclose); R("fread", f_fread);   R("fwrite", f_fwrite);
+    register_guest_stdio_hle();   // fopen and the rest of the open family (guest_stdio.cpp)
+    R("fclose", f_fclose);
+    R("fread", f_fread);
+    R("fwrite", f_fwrite);
     R("fseek", f_fseek);   R("ftell", f_ftell);   R("fgets", f_fgets);   R("fflush", f_fflush);
     R("feof", f_feof);     R("ferror", f_ferror); R("setvbuf", f_setvbuf); R("rewind", f_rewind);
     R("fgetc", f_fgetc);   R("getc", f_fgetc);

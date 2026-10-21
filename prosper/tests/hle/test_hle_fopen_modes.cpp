@@ -15,6 +15,11 @@
 // `ftell`, `fgetc`, `fflush`, `fclose`, and `__error` for the guest's errno). So each case opens a
 // GUEST path through the handler and drives the stream through the handlers; the host's own stdio
 // appears only to build a fixture or to observe the bytes that reached the disk.
+//
+// The rest of the open family — freopen, fdopen, fopen_s, freopen_s — shares fopen's mode parser
+// (#4348). Each was the return-0 stub: a NULL FILE* from freopen/fdopen, and "success" with the
+// out-pointer never written from fopen_s/freopen_s, which a title would read as a real stream. Their
+// contracts are C11 §7.21.5.4 (freopen), POSIX fdopen, and Annex K §K.3.5.2.1-2.
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/fs/guest_fopen_mode.hpp"
@@ -98,6 +103,20 @@ protected:
     static int getc(FILE* f) { return (int)(int64_t)call("fgetc", ptr(f)); }
     static int flush(FILE* f) { return (int)(int64_t)call("fflush", ptr(f)); }
     static int close(FILE* f) { return (int)(int64_t)call("fclose", ptr(f)); }
+
+    // FreeBSD open(2) access modes, as the guest passes them.
+    static constexpr uint64_t kGuestORdOnly = 0x0;
+    static constexpr uint64_t kGuestORdWr = 0x2;
+    static int guest_open(const std::string& name, uint64_t flags) {
+        const std::string path = guest(name);
+        return (int)(int64_t)call("open", ptr(path.c_str()), flags, 0);
+    }
+    static FILE* from_fd(int fd, const char* mode) {
+        return (FILE*)(uintptr_t)call("fdopen", (uint64_t)(int64_t)fd, ptr(mode));
+    }
+    static FILE* reopen(const char* path, const char* mode, FILE* f) {
+        return (FILE*)(uintptr_t)call("freopen", ptr(path), ptr(mode), ptr(f));
+    }
 
     static inline std::string root_;
 };
@@ -341,6 +360,239 @@ TEST_F(FopenModes, AppendExclusive) {
     EXPECT_EQ(guest_errno(), EEXIST);
 #endif
     EXPECT_EQ(get("ax.bin"), "keep");
+}
+
+// --- the rest of the open family: freopen, fdopen, fopen_s, freopen_s (#4348) -------------------
+// The errno values these return (fopen_s, freopen_s) are FreeBSD numbers; every one asserted here —
+// ENOENT 2, EBADF 9, EEXIST 17, EINVAL 22 — has the same number on every host.
+
+// freopen points the SAME stream at another guest path, under the new mode.
+TEST_F(FopenModes, FreopenRedirectsTheSameStream) {
+    put("first.bin", "first");
+    put("second.bin", "second");
+    FILE* f = open("first.bin", "r");
+    ASSERT_NE(f, nullptr);
+    const std::string second = guest("second.bin");
+    ASSERT_EQ(reopen(second.c_str(), "r", f), f) << "freopen returns the stream it was given";
+    EXPECT_EQ(read(f, 16), "second");
+
+    const std::string first = guest("first.bin");
+    ASSERT_EQ(reopen(first.c_str(), "w", f), f);
+    EXPECT_EQ(std::filesystem::file_size(host("first.bin")), 0u) << "\"w\" truncates at the reopen";
+    EXPECT_EQ(write(f, "new"), 3u);
+    EXPECT_EQ(close(f), 0);
+    EXPECT_EQ(get("first.bin"), "new");
+    EXPECT_EQ(get("second.bin"), "second");
+}
+
+// A refused reopen has still closed the stream's file first (C11 §7.21.5.4p4), so what the stream
+// had buffered reaches the old file. One case per refusal: the mode, a path outside every mount,
+// and the host's own open.
+TEST_F(FopenModes, FreopenFailureClosesTheOldFile) {
+    struct Case {
+        const char* path;
+        const char* mode;
+        int error;
+    };
+    remove("absent-reopen.bin");
+    const std::string absent = guest("absent-reopen.bin");
+    const Case cases[] = {
+        {absent.c_str(), "z", EINVAL},
+        {"/nowhere/at/all.bin", "r", ENOENT},
+        {absent.c_str(), "r", ENOENT},
+    };
+    for (const Case& c : cases) {
+        FILE* f = open("pending.bin", "w");
+        ASSERT_NE(f, nullptr);
+        EXPECT_EQ(write(f, "pending"), 7u);
+        set_guest_errno(0);
+        EXPECT_EQ(reopen(c.path, c.mode, f), nullptr) << c.path << " '" << c.mode << "'";
+        EXPECT_EQ(guest_errno(), c.error) << c.path << " '" << c.mode << "'";
+        EXPECT_EQ(get("pending.bin"), "pending")
+            << c.path << " '" << c.mode << "': the old file was flushed and closed";
+        EXPECT_FALSE(exists("absent-reopen.bin"));
+    }
+}
+
+// A null path asks for a mode change in place, which prosper does not support: it is refused
+// EBADF and, unlike every other refusal, the stream stays open and usable. A null stream is EINVAL.
+TEST_F(FopenModes, FreopenNullPathOrStreamIsRefused) {
+    put("keep-open.bin", "still here");
+    FILE* f = open("keep-open.bin", "r");
+    ASSERT_NE(f, nullptr);
+    set_guest_errno(0);
+    EXPECT_EQ(reopen(nullptr, "rb", f), nullptr);
+    EXPECT_EQ(guest_errno(), EBADF);
+    EXPECT_EQ(read(f, 32), "still here") << "the refused stream is still open";
+    EXPECT_EQ(close(f), 0);
+
+    const std::string path = guest("keep-open.bin");
+    set_guest_errno(0);
+    EXPECT_EQ(reopen(path.c_str(), "r", nullptr), nullptr);
+    EXPECT_EQ(guest_errno(), EINVAL);
+}
+
+// fdopen stands a stream on a descriptor the guest's own open returned, and fclose closes both.
+// "w" neither truncates nor creates — the file is already open — and an 'x' asks nothing of a
+// descriptor that already exists.
+TEST_F(FopenModes, FdopenStandsAStreamOnAGuestDescriptor) {
+    put("fd.bin", "0123456789");
+    int fd = guest_open("fd.bin", kGuestORdWr);
+    ASSERT_GE(fd, 3);
+    FILE* f = from_fd(fd, "r+");
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(read(f, 4), "0123");
+    EXPECT_EQ(seek(f, 0, SEEK_SET), 0);
+    EXPECT_EQ(write(f, "AB"), 2u);
+    EXPECT_EQ(close(f), 0);
+    EXPECT_EQ(get("fd.bin"), "AB23456789");
+    EXPECT_EQ((int64_t)call("close", (uint64_t)fd), -1) << "fclose closed the descriptor too";
+
+    fd = guest_open("fd.bin", kGuestORdWr);
+    ASSERT_GE(fd, 3);
+    f = from_fd(fd, "w");
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(std::filesystem::file_size(host("fd.bin")), 10u) << "fdopen \"w\" does not truncate";
+    EXPECT_EQ(write(f, "Z"), 1u);
+    EXPECT_EQ(close(f), 0);
+    EXPECT_EQ(get("fd.bin"), "ZB23456789");
+
+    fd = guest_open("fd.bin", kGuestORdWr);
+    ASSERT_GE(fd, 3);
+    f = from_fd(fd, "w+x");
+    ASSERT_NE(f, nullptr) << "exclusivity belongs to the open that made the descriptor";
+    EXPECT_EQ(read(f, 16), "ZB23456789");
+    EXPECT_EQ(close(f), 0);
+}
+
+// A bad mode is EINVAL and leaves the descriptor open; a descriptor that is not open is EBADF; the
+// random device is ENODEV, as it is for fopen (a host stream would read its null backing object).
+TEST_F(FopenModes, FdopenRefusals) {
+    put("fdbad.bin", "x");
+    const int fd = guest_open("fdbad.bin", kGuestORdOnly);
+    ASSERT_GE(fd, 3);
+    for (const char* mode : {"z", "", (const char*)nullptr}) {
+        set_guest_errno(0);
+        EXPECT_EQ(from_fd(fd, mode), nullptr) << (mode ? mode : "(null)");
+        EXPECT_EQ(guest_errno(), EINVAL) << (mode ? mode : "(null)");
+    }
+    EXPECT_EQ(call("close", (uint64_t)fd), 0u) << "a refused fdopen leaves the descriptor open";
+
+    set_guest_errno(0);
+    EXPECT_EQ(from_fd(fd, "r"), nullptr) << "the descriptor is closed now";
+    EXPECT_EQ(guest_errno(), EBADF);
+    set_guest_errno(0);
+    EXPECT_EQ(from_fd(-1, "r"), nullptr);
+    EXPECT_EQ(guest_errno(), EBADF);
+
+    const int dev = (int)(int64_t)call("open", ptr("/dev/urandom"), kGuestORdOnly, 0);
+    ASSERT_GE(dev, 3);
+    set_guest_errno(0);
+    EXPECT_EQ(from_fd(dev, "r"), nullptr);
+    EXPECT_EQ(guest_errno(), ENODEV);
+    EXPECT_EQ(call("close", (uint64_t)dev), 0u);
+}
+
+// Descriptors 0-2 are prosper's own stdio, which the guest's close leaves open. A stream fdopen'd on
+// one stands on a duplicate, so its fclose leaves the descriptor open too.
+TEST_F(FopenModes, FdopenOnStdioDoesNotCloseIt) {
+    constexpr uint64_t kGuestFGetFd = 1;
+    if ((int64_t)call("fcntl", 2, kGuestFGetFd) < 0) GTEST_SKIP() << "no stderr descriptor";
+    FILE* f = from_fd(2, "w");
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(close(f), 0);
+    EXPECT_GE((int64_t)call("fcntl", 2, kGuestFGetFd), 0) << "fd 2 survives its stream's fclose";
+}
+
+#if defined(_WIN32)
+// On Windows a directory descriptor is prosper's own snapshot, not a CRT descriptor: no host stream
+// can stand on it, so fdopen refuses it rather than hand the CRT a number it does not own.
+TEST_F(FopenModes, FdopenRefusesADirectoryDescriptor) {
+    std::filesystem::create_directories(host("fd-dir"));
+    const int fd = guest_open("fd-dir", kGuestORdOnly);
+    ASSERT_GE(fd, 3);
+    set_guest_errno(0);
+    EXPECT_EQ(from_fd(fd, "r"), nullptr);
+    EXPECT_EQ(guest_errno(), EISDIR);
+    EXPECT_EQ(call("close", (uint64_t)fd), 0u);
+}
+#endif
+
+// fopen_s: zero, with the stream stored through the out-pointer; or an errno value, with NULL
+// stored there. A null out-pointer, path or mode is EINVAL.
+TEST_F(FopenModes, FopenSReturnsAnErrnoAndWritesTheOutPointer) {
+    static int sentinel;
+    FILE* const unset = (FILE*)&sentinel;
+    put("fopens.bin", "annex k");
+    const std::string path = guest("fopens.bin");
+    FILE* out = unset;
+    EXPECT_EQ(call("fopen_s", ptr(&out), ptr(path.c_str()), ptr("r")), 0u);
+    ASSERT_NE(out, nullptr);
+    ASSERT_NE(out, unset) << "the stream was stored through the out-pointer";
+    EXPECT_EQ(read(out, 16), "annex k");
+    EXPECT_EQ(close(out), 0);
+
+    struct Case {
+        const char* path;
+        const char* mode;
+        uint64_t status;
+    };
+    remove("fopens-absent.bin");
+    const std::string absent = guest("fopens-absent.bin");
+    const Case cases[] = {
+        {absent.c_str(), "r", ENOENT}, {path.c_str(), "wx", EEXIST},    {path.c_str(), "z", EINVAL},
+        {nullptr, "r", EINVAL},        {path.c_str(), nullptr, EINVAL},
+    };
+    for (const Case& c : cases) {
+        out = unset;
+        EXPECT_EQ(call("fopen_s", ptr(&out), ptr(c.path), ptr(c.mode)), c.status)
+            << (c.path ? c.path : "(null)") << " '" << (c.mode ? c.mode : "(null)") << "'";
+        EXPECT_EQ(out, nullptr) << "a failed fopen_s stores NULL";
+    }
+    EXPECT_FALSE(exists("fopens-absent.bin"));
+    EXPECT_EQ(get("fopens.bin"), "annex k") << "\"wx\" left the existing file alone";
+    EXPECT_EQ(call("fopen_s", 0, ptr(path.c_str()), ptr("r")), (uint64_t)EINVAL)
+        << "null out-pointer";
+}
+
+// freopen_s: zero with the given stream stored on success. A null out-pointer, mode or stream is
+// EINVAL and closes nothing; a null path is the mode change freopen refuses (EBADF), which also
+// leaves the stream open; a failed open closes the stream and returns the error, storing NULL.
+TEST_F(FopenModes, FreopenSReturnsAnErrnoAndWritesTheOutPointer) {
+    static int sentinel;
+    FILE* const unset = (FILE*)&sentinel;
+    put("reopens-a.bin", "a");
+    put("reopens-b.bin", "b");
+    const std::string b = guest("reopens-b.bin");
+    FILE* f = open("reopens-a.bin", "r");
+    ASSERT_NE(f, nullptr);
+    FILE* out = unset;
+    EXPECT_EQ(call("freopen_s", ptr(&out), ptr(b.c_str()), ptr("r"), ptr(f)), 0u);
+    ASSERT_EQ(out, f) << "success stores the stream it was given";
+    EXPECT_EQ(read(f, 4), "b");
+
+    out = unset;
+    EXPECT_EQ(call("freopen_s", ptr(&out), ptr(b.c_str()), 0, ptr(f)), (uint64_t)EINVAL)
+        << "null mode";
+    EXPECT_EQ(out, nullptr);
+    EXPECT_EQ(call("freopen_s", 0, ptr(b.c_str()), ptr("r"), ptr(f)), (uint64_t)EINVAL)
+        << "null out-pointer";
+    out = unset;
+    EXPECT_EQ(call("freopen_s", ptr(&out), ptr(b.c_str()), ptr("r"), 0), (uint64_t)EINVAL)
+        << "null stream";
+    EXPECT_EQ(out, nullptr);
+    out = unset;
+    EXPECT_EQ(call("freopen_s", ptr(&out), 0, ptr("r"), ptr(f)), (uint64_t)EBADF) << "null path";
+    EXPECT_EQ(out, nullptr);
+    EXPECT_EQ(seek(f, 0, SEEK_SET), 0);
+    EXPECT_EQ(read(f, 4), "b") << "none of those refusals closed the stream";
+
+    remove("reopens-absent.bin");
+    const std::string absent = guest("reopens-absent.bin");
+    out = unset;
+    EXPECT_EQ(call("freopen_s", ptr(&out), ptr(absent.c_str()), ptr("r"), ptr(f)),
+              (uint64_t)ENOENT);
+    EXPECT_EQ(out, nullptr) << "a failed freopen_s stores NULL (and has closed the stream)";
 }
 
 // The translation itself, for BOTH host dialects on every host — the Windows spelling is checked

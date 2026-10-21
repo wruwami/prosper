@@ -6,9 +6,13 @@ save data the platform layers on top of it.
 - `hle_file` — the POSIX and `sceKernel*` file surface, with the guest mount table (`/app0`,
   `/temp0`, `/savedata0`, `/download0`). The largest thing here and still per-platform in one
   file; see the note below.
+- `guest_stdio` — the C stdio open family (`fopen`, `freopen`, `fdopen`, `fopen_s`,
+  `freopen_s`), registered from `register_file_hle()`. It asks `hle_file` for the mount-table
+  answer and the per-host descriptor work, which stay there; the rest of the stream surface
+  (`fread`, `fclose`, ...) is still in `hle_file`. Only titles that ship no libc.prx reach it.
 - `guest_fopen_mode` — the guest's `fopen` mode grammar (Dinkumware `_Foprep`, read from the
   shipped libc.prx), re-spelled for the host C library; on Windows a verbatim mode opened guest
-  binary files in text mode. Only titles that ship no libc.prx reach it.
+  binary files in text mode. Every entry point in `guest_stdio` reads its mode through it.
 - `guest_devices` — the device nodes the guest namespace serves itself: `/dev/urandom` and
   `/dev/random`, read by every IL2CPP title's crypto provider. Reads come from the host CSPRNG on a
   descriptor backed by the host null device; the guest's spelling never reaches the host. Nothing

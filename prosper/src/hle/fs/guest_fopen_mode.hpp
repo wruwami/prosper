@@ -1,5 +1,6 @@
 // guest_fopen_mode.hpp — a guest `fopen` mode string, read by the guest's rules and re-spelled for
-// the host C library.
+// the host C library. fopen, freopen, fdopen, fopen_s and freopen_s all read their mode through
+// it (guest_stdio.cpp, #4348), so no two of them can disagree on one.
 //
 // Scope: the linker binds each title's `fopen` import to its OWN sce_module/libc.prx export first
 // (linker.cpp pass 2, "Cross-module export beats a local slot"), and every local dump ships one. So
